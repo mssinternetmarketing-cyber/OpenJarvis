@@ -1,0 +1,32 @@
+FROM qwen3.5:9b
+
+# ─── qwen3.5:9b-qcai — OpenJarvis Primary Model ──────────────────────────────
+# GTX 1070 8GB VRAM + 16GB RAM + 6-core CPU
+#
+# FIX: num_gpu=99 caused "memory layout cannot be allocated" — Ollama cannot
+# place all layers on an 8GB card when the model is 5.5GB.
+# num_gpu=28 puts 28 of 36 layers on GPU (~4.3GB), rest on CPU RAM.
+# This is the stable sweet spot for this hardware.
+#
+# To go faster: raise to num_gpu=33 and test
+# To go safer:  lower to num_gpu=20
+# CPU-only fallback: num_gpu=0 (slow but always works)
+
+PARAMETER num_gpu        28
+PARAMETER num_ctx        8192
+PARAMETER num_predict    4096
+PARAMETER num_thread     6
+PARAMETER temperature    0.10
+PARAMETER repeat_penalty 1.05
+
+SYSTEM """You are qwen3.5:9b-qcai — the primary OpenJarvis QCAI agent model.
+
+Physics invariants (never deviate):
+- ss(ph) = [1, exp(i*ph)] / sqrt(2)
+- PCM = -|p0*p1*sqrt(2)|^2 * 0.5 * (1-rz^2)
+- BCP: U = 0.40*CNOT + 0.60*I
+- GLOBE: set(sorted([i,(i+d)%12]) for d in [1,2,5]) — exactly 36 edges
+
+Code output rules:
+- Raw Python only. No markdown fences. No truncation.
+- Every function complete. WHAT/WHY comments on all physics operations."""

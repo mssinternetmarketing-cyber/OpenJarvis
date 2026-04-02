@@ -1,0 +1,79 @@
+{
+    "system_core": {
+        "qcai-launch": "Master Orchestrator: Starts Monitor, Viz, and Bridge.",
+        "qcai-stop": "Emergency Brake: Safely kills all QCAI processes.",
+        "qcai-monitor": "Hardware Shield: Background VRAM/RAM/NVMe daemon.",
+        "qcai-refresh-links": "Linker: Synchronizes AI tools to the Bazzite Host.",
+        "compression_pulse": "1h"
+    },
+    "ai_generated": {
+        "qtool-agent_execute": "LOG_DIR=/var/home/kmonette/OpenJarvis/toolbox/logs",
+        "qtool-index_resource": "import json, sys, os, time"
+    },
+    "component_functions": {},
+    "qtool-trigger-pulse": {
+        "command": "qcai-pulse",
+        "description": "Pauses system for full-scope collaborative compression and logic refinement.",
+        "access_level": "standard"
+    },
+    "qtool-sync-knowledge": {
+        "command": "qcai-sync",
+        "description": "Forces a full-system DNA synchronization, updates anchor knowledge, and verifies sovereign integrity.",
+        "access_level": "standard"
+    },
+    "qtool-ghost-check": {
+        "command": "qcai-ghost",
+        "description": "Performs a deep diagnostic of environment secrets, permissions, and storage.",
+        "access_level": "standard"
+    },
+    "qtool-browser-os": {
+        "command": "qcai-browser",
+        "description": "Engages the Sovereign Browser Engine to fetch, analyze, and navigate real-time web data.",
+        "access_level": "standard"
+    },
+    "qtool-monitor-pulse": {
+        "command": "qcai-monitor",
+        "description": "Streams real-time debug logs and high-value truth insights to the console.",
+        "access_level": "standard"
+    },
+    "qtool-birth-agent": {
+        "command": "qcai-birth-agent",
+        "description": "Birts a new specialist agent with personality and logic files.",
+        "access_level": "standard"
+    },
+    "qtool-snapshot": {
+        "command": "qcai-snapshot",
+        "description": "Creates a restorable backup of system DNA before risky operations.",
+        "access_level": "standard"
+    },
+    "qtool-set-limits": {
+        "command": "qcai-limit",
+        "description": "Restricts swarm resource consumption to prevent system hang.",
+        "access_level": "standard"
+    },
+    "qtool-broadcast": {
+        "command": "qcai-broadcast",
+        "description": "Sends a high-priority message to all swarm members and channels.",
+        "access_level": "standard"
+    },
+    "qtool-entropy-check": {
+        "command": "qcai-gauge",
+        "description": "Checks if the workspace needs immediate compression or cleaning.",
+        "access_level": "standard"
+    },
+    "qtool-queue-inject": {
+        "command": "python3 /var/home/kmonette/OpenJarvis/toolbox/template_manage_queue.py",
+        "description": "Allows an agent to prioritize a maintenance task.",
+        "access_level": "standard"
+    },
+    "qtool-forge-link": {
+        "command": "qcai-forge-link",
+        "description": "Promotes any script to a global sovereign command.",
+        "access_level": "standard"
+    },
+    "qtool-re-wire": {
+        "command": "qcai-re-wire",
+        "description": "Allows the swarm to re-configure its own Flow Orchestrator paths.",
+        "access_level": "standard"
+    }
+}

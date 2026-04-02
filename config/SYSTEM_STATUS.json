@@ -1,0 +1,6 @@
+{
+  "timestamp": "2026-04-02T20:46:11Z",
+  "vram_gb": 0, "vram_status": "GREEN",
+  "ram_pct": 63, "ram_status": "GREEN",
+  "disk_pct": 26, "disk_free": "345G", "disk_status": "GREEN"
+}

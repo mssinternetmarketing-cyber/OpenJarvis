@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# stop_qcai.sh v9.1 — Stop all QCAI processes safely
+# Usage: ~/stop_qcai.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🛑 Stopping QCAI"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Stop bridge
+if pkill -f slack_bridge.py 2>/dev/null; then
+    echo "  ✅ Bridge stopped"
+else
+    echo "  ⚠️  Bridge was not running"
+fi
+
+# Clear port 9999
+if fuser -k 9999/tcp 2>/dev/null || lsof -ti:9999 | xargs kill -9 2>/dev/null; then
+    echo "  ✅ Port 9999 cleared"
+else
+    echo "  ℹ️  Port 9999 already clear"
+fi
+
+sleep 1
+echo ""
+echo "  Done. Run ~/launch_qcai.sh to restart."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

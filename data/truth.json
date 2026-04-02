@@ -1,0 +1,18 @@
+{
+    "system_version": "13.0",
+    "architecture": "Hybrid-Sovereign",
+    "status": "Marathon-Ready",
+    "logic_centers": {
+        "bin": "Motor execution & Pulse control",
+        "core": "Primary Intelligence & BrowserOS Hook",
+        "config": "Sovereign Secrets & Tool Registry",
+        "agents": "Specialized Swarm & The Forge",
+        "data": "Persistent Truth Ledger & Insights"
+    },
+    "capabilities": [
+        "Autonomous Swarm Expansion",
+        "Self-Evolution via Forge",
+        "Sequential Reflection",
+        "Web-Perception"
+    ]
+}

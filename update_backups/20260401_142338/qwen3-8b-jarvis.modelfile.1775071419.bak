@@ -1,0 +1,19 @@
+FROM qwen3:8b
+
+# ─── qwen3-8b-jarvis — OpenJarvis Fallback Model ─────────────────────────────
+# GTX 1070 8GB VRAM + 16GB RAM + 6-core CPU
+#
+# FIX: num_gpu=99 caused OOM — same issue as primary model.
+# qwen3:8b = ~28 layers, ~5.0GB weights Q4_K_M
+# num_gpu=24 puts 24 of 28 layers on GPU (~4.3GB), safe headroom.
+
+PARAMETER num_gpu        24
+PARAMETER num_ctx        8192
+PARAMETER num_predict    3000
+PARAMETER num_thread     6
+PARAMETER temperature    0.15
+PARAMETER repeat_penalty 1.1
+
+SYSTEM """You are qwen3-8b-jarvis — the OpenJarvis fallback agent on local Ollama.
+You activate when cloud inference is unavailable.
+Keep sequences short (3-4 agents). Raw Python only for code. No fences."""

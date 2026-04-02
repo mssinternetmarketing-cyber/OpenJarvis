@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""
+tester.py — QCAI Component Tester v1.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runs automated tests on each component before it can be promoted.
+Tests are component-specific and include:
+  - Structural checks (syntax, line count, no fences)
+  - Symbol exports (required functions/classes present)
+  - Physics numerical tests (actual computed values checked)
+  - Integration checks (correct imports, assertions present)
+  - Wayland rendering checks for visualization components
+
+If a component fails: detailed failure report sent back to its Builder.
+If a component passes: sent to Reviewer for qualitative scoring.
+"""
+
+import ast, re, os, sys, json, logging, textwrap
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+
+log = logging.getLogger("tester")
+
+# ─── Test Result ──────────────────────────────────────────────────────────────
+
+@dataclass
+class TestResult:
+    component:   str
+    passed:      bool
+    failures:    List[str]   = field(default_factory=list)
+    warnings:    List[str]   = field(default_factory=list)
+    passes:      List[str]   = field(default_factory=list)
+    lines:       int         = 0
+    score:       int         = 0      # 0-100
+    feedback:    str         = ""     # formatted for Builder
+
+# ─── Component Tester ─────────────────────────────────────────────────────────
+
+class ComponentTester:
+
+    def __init__(self, ws_root: str):
+        self.ws_root = ws_root
+
+    def test(self, name: str, code: str) -> TestResult:
+        """Run all tests for a component. Returns TestResult."""
+        r = TestResult(component=name, passed=False,
+                       lines=code.count('\n'))
+
+        # ── Universal checks ──────────────────────────────────────────────────
+        self._check_universal(name, code, r)
+        if r.failures:
+            r.passed = False
+            r.score  = 0
+            r.feedback = self._format_feedback(name, r)
+            return r
+
+        # ── Component-specific tests ──────────────────────────────────────────
+        test_fn = getattr(self, f"_test_{name}", None)
+        if test_fn:
+            test_fn(code, r)
+
+        # ── Score ─────────────────────────────────────────────────────────────
+        total = len(r.failures) + len(r.passes)
+        r.score = int(len(r.passes) / total * 100) if total > 0 else 50
+        r.passed = len(r.failures) == 0
+        r.feedback = self._format_feedback(name, r)
+        return r
+
+    # ── Universal Checks ──────────────────────────────────────────────────────
+
+    def _check_universal(self, name: str, code: str, r: TestResult):
+        """Checks that apply to every component."""
+        from component_manager import COMPONENT_MIN_LINES
+
+        # No markdown fences
+        if '```' in code:
+            r.failures.append("Contains markdown fences — output must be raw Python")
+            return
+
+        # Minimum lines
+        min_l = COMPONENT_MIN_LINES.get(name, 10)
+        if r.lines < min_l:
+            r.failures.append(
+                f"Too short: {r.lines} lines (minimum {min_l} for {name})")
+            return
+
+        # Valid Python syntax
+        try:
+            ast.parse(code)
+            r.passes.append("Valid Python syntax")
+        except SyntaxError as e:
+            r.failures.append(f"SyntaxError: {e}")
+            return
+
+        # No bare 'pass' as entire content
+        stripped = code.strip()
+        if stripped == "pass" or stripped == "# placeholder\npass":
+            r.failures.append("Component is a placeholder — needs real implementation")
+            return
+
+        r.passes.append("Universal checks passed")
+
+    def _has_symbol(self, code: str, symbol: str) -> bool:
+        """Check if a symbol (function/class/constant) is defined in code."""
+        patterns = [
+            rf"^def {re.escape(symbol)}\s*\(",
+            rf"^class {re.escape(symbol)}\s*[\(:]",
+            rf"^{re.escape(symbol)}\s*=",
+        ]
+        for p in patterns:
+            if re.search(p, code, re.MULTILINE):
+                return True
+        # Also check as method
+        if re.search(rf"def {re.escape(symbol)}\s*\(self", code):
+            return True
+        return False
+
+    def _run_numerical(self, code: str, test_code: str,
+                       description: str, r: TestResult):
+        """Run a numerical test by executing code + test_code."""
+        try:
+            namespace = {}
+            exec(compile(code, '<component>', 'exec'), namespace)
+            exec(compile(test_code, '<test>', 'exec'), namespace)
+            r.passes.append(f"Numerical: {description}")
+        except AssertionError as e:
+            r.failures.append(f"Numerical FAIL — {description}: {e}")
+        except Exception as e:
+            r.warnings.append(f"Numerical error — {description}: {e}")
+
+    # ── c01_header Tests ──────────────────────────────────────────────────────
+
+    def _test_c01_header(self, code: str, r: TestResult):
+        # Required imports
+        for imp in ['numpy', 'matplotlib', 'threading', 'warnings']:
+            if imp in code:
+                r.passes.append(f"Import present: {imp}")
+            else:
+                r.warnings.append(f"Expected import: {imp}")
+
+        # TkAgg must be set before pyplot
+        if "matplotlib.use('TkAgg')" in code or 'matplotlib.use("TkAgg")' in code:
+            r.passes.append("matplotlib.use('TkAgg') present")
+        else:
+            r.failures.append("Missing: matplotlib.use('TkAgg') — required for Wayland")
+
+        # Physics constants
+        for const in ['N_NODES', 'BCP_ALPHA', 'DATA_PORT']:
+            if self._has_symbol(code, const):
+                r.passes.append(f"Constant defined: {const}")
+            else:
+                r.failures.append(f"Missing constant: {const}")
+
+        # CNOT matrix
+        if 'CNOT' in code:
+            r.passes.append("CNOT matrix defined")
+        else:
+            r.failures.append("Missing: CNOT matrix")
+
+        # BCP_ALPHA must be 0.40
+        m = re.search(r'BCP_ALPHA\s*=\s*([\d.]+)', code)
+        if m:
+            val = float(m.group(1))
+            if abs(val - 0.40) < 1e-6:
+                r.passes.append("BCP_ALPHA = 0.40 ✅")
+            else:
+                r.failures.append(f"BCP_ALPHA = {val} (must be 0.40)")
+
+    # ── c02_physics Tests ─────────────────────────────────────────────────────
+
+    def _test_c02_physics(self, code: str, r: TestResult):
+        # Required functions
+        for fn in ['ss', 'pof', 'compute_pcm', 'bcp_step',
+                   'von_neumann_entropy', 'compute_cv', 'compute_negfrac']:
+            if self._has_symbol(code, fn):
+                r.passes.append(f"Function defined: {fn}")
+            else:
+                r.failures.append(f"Missing function: {fn}")
+
+        # pcm_color and pcm_emoji
+        for fn in ['pcm_color', 'pcm_emoji']:
+            if self._has_symbol(code, fn):
+                r.passes.append(f"Helper defined: {fn}")
+            else:
+                r.warnings.append(f"Missing helper: {fn}")
+
+        # Numerical tests — physics must be exact
+        physics_setup = """
+import numpy as np
+
+""" + code + """
+"""
+        self._run_numerical(physics_setup,
+            "p = ss(0); assert abs(abs(p[0]) - 1/np.sqrt(2)) < 1e-6, f'ss(0) p[0]={p[0]}'",
+            "ss(0) returns |+> state", r)
+
+        self._run_numerical(physics_setup,
+            "p = ss(np.pi/4); pcm = compute_pcm(p); assert pcm < 0, f'PCM={pcm}'",
+            "compute_pcm returns negative for superposition", r)
+
+        self._run_numerical(physics_setup,
+            """
+p = ss(np.pi/4)
+ov = abs(p[0]*p[1].conj()*np.sqrt(2))**2
+rz = float(abs(p[0])**2 - abs(p[1])**2)
+expected = float(-ov * 0.5 * (1.0 - rz**2))
+actual = compute_pcm(p)
+assert abs(actual - expected) < 1e-6, f'PCM formula mismatch: expected {expected}, got {actual}'
+""",
+            "PCM formula matches GROUND_TRUTH exactly", r)
+
+        self._run_numerical(physics_setup,
+            """
+import numpy as np
+pA = ss(0); pB = ss(np.pi)
+pA2, pB2 = bcp_step(pA, pB)
+assert abs(np.linalg.norm(pA2) - 1.0) < 1e-6, f'BCP broke norm: {np.linalg.norm(pA2)}'
+assert abs(np.linalg.norm(pB2) - 1.0) < 1e-6, f'BCP broke norm: {np.linalg.norm(pB2)}'
+""",
+            "bcp_step preserves qubit norms", r)
+
+        self._run_numerical(physics_setup,
+            """
+phases = [0.0] * 12
+cv = compute_cv(phases)
+assert cv < 0.01, f'cv should be ~0 for identical phases, got {cv}'
+""",
+            "compute_cv ≈ 0 for identical phases", r)
+
+        self._run_numerical(physics_setup,
+            """
+phases = [i * 2 * 3.14159 / 12 for i in range(12)]
+cv = compute_cv(phases)
+assert cv > 0.9, f'cv should be ~1 for evenly spaced phases, got {cv}'
+""",
+            "compute_cv ≈ 1 for evenly spaced phases", r)
+
+    # ── c03_nodes Tests ───────────────────────────────────────────────────────
+
+    def _test_c03_nodes(self, code: str, r: TestResult):
+        for sym in ['NN', 'FAMILIES', 'NODE_FAMILY', 'FAMILY_COLORS']:
+            if sym in code:
+                r.passes.append(f"Symbol present: {sym}")
+            else:
+                r.failures.append(f"Missing: {sym}")
+
+        # NN must have 12 nodes
+        m = re.search(r'NN\s*=\s*\[([^\]]+)\]', code, re.DOTALL)
+        if m:
+            names = [x.strip().strip('"\'') for x in m.group(1).split(',') if x.strip()]
+            if len(names) == 12:
+                r.passes.append(f"NN has 12 nodes ✅")
+            else:
+                r.failures.append(f"NN has {len(names)} nodes (need 12)")
+
+        # Required node names
+        required_nodes = ["Omega", "Guardian", "Sentinel", "Nexus", "Storm",
+                          "Sora", "Echo", "Iris", "Sage", "Kevin", "Atlas", "Void"]
+        for node in required_nodes:
+            if node in code:
+                pass
+            else:
+                r.failures.append(f"Missing node: {node}")
+        r.passes.append(f"All 12 node names present")
+
+        # Family colors
+        for fam in ['GodCore', 'Independent', 'Maverick']:
+            if fam in code:
+                r.passes.append(f"Family defined: {fam}")
+            else:
+                r.failures.append(f"Missing family: {fam}")
+
+    # ── c04_topology Tests ────────────────────────────────────────────────────
+
+    def _test_c04_topology(self, code: str, r: TestResult):
+        if 'GLOBE' in code:
+            r.passes.append("GLOBE defined")
+        else:
+            r.failures.append("Missing: GLOBE topology")
+
+        if 'assert len(GLOBE)' in code:
+            r.passes.append("assert len(GLOBE)==36 present ✅")
+        else:
+            r.failures.append("Missing: assert len(GLOBE) == 36 — REQUIRED")
+
+        # Check d=[1,2,5] pattern
+        if all(str(d) in code for d in [1, 2, 5]):
+            r.passes.append("Globe distances d=[1,2,5] present")
+        else:
+            r.failures.append("Missing globe distances d=[1,2,5]")
+
+        if self._has_symbol(code, 'icosphere_positions'):
+            r.passes.append("icosphere_positions defined")
+        else:
+            r.warnings.append("icosphere_positions not found")
+
+        if 'NODE_POS' in code:
+            r.passes.append("NODE_POS defined")
+        else:
+            r.failures.append("Missing: NODE_POS")
+
+        # Numerical: GLOBE must have exactly 36 edges
+        topo_setup = "import numpy as np\n" + code
+        self._run_numerical(topo_setup,
+            "assert len(GLOBE) == 36, f'GLOBE has {len(GLOBE)} edges (need 36)'",
+            "GLOBE has exactly 36 edges", r)
+
+    # ── c05_curriculum Tests ──────────────────────────────────────────────────
+
+    def _test_c05_curriculum(self, code: str, r: TestResult):
+        if 'DOMAINS' in code:
+            r.passes.append("DOMAINS defined")
+        else:
+            r.failures.append("Missing: DOMAINS list")
+
+        if 'VOCAB' in code:
+            r.passes.append("VOCAB defined")
+        else:
+            r.failures.append("Missing: VOCAB dict")
+
+        # Must have exactly 9 domains
+        m = re.search(r'DOMAINS\s*=\s*\[([^\]]+)\]', code, re.DOTALL)
+        if m:
+            domains = [x.strip().strip('"\'') for x in m.group(1).split(',') if x.strip()]
+            if len(domains) == 9:
+                r.passes.append("DOMAINS has 9 entries ✅")
+            else:
+                r.failures.append(f"DOMAINS has {len(domains)} entries (need 9)")
+
+        # Required domain names
+        required = ["love_safety", "ethics", "philosophy", "english", "math",
+                    "physics", "science", "programming", "flourishing"]
+        missing = [d for d in required if d not in code]
+        if not missing:
+            r.passes.append("All 9 domain names present ✅")
+        else:
+            r.failures.append(f"Missing domains: {missing}")
+
+    # ── c06_system Tests ──────────────────────────────────────────────────────
+
+    def _test_c06_system(self, code: str, r: TestResult):
+        if self._has_symbol(code, 'QCAISystem'):
+            r.passes.append("QCAISystem class defined")
+        else:
+            r.failures.append("Missing: QCAISystem class")
+
+        for method in ['evolve', 'get_snapshot', '_generate_token']:
+            if method in code:
+                r.passes.append(f"Method defined: {method}")
+            else:
+                r.failures.append(f"Missing method: {method}")
+
+        if 'self.lock' in code or 'threading.Lock' in code:
+            r.passes.append("Thread lock present")
+        else:
+            r.warnings.append("No thread lock — may have race conditions")
+
+        if 'home_phases' in code:
+            r.passes.append("home_phases defined (self-heal targets)")
+        else:
+            r.failures.append("Missing: home_phases for self-healing")
+
+    # ── c07_dataserver Tests ──────────────────────────────────────────────────
+
+    def _test_c07_dataserver(self, code: str, r: TestResult):
+        for sym in ['DataHandler', 'start_data_server']:
+            if self._has_symbol(code, sym) or sym in code:
+                r.passes.append(f"Symbol present: {sym}")
+            else:
+                r.failures.append(f"Missing: {sym}")
+
+        if 'do_POST' in code:
+            r.passes.append("do_POST handler defined")
+        else:
+            r.failures.append("Missing: do_POST method")
+
+        if '9999' in code or 'DATA_PORT' in code:
+            r.passes.append("Port 9999 / DATA_PORT referenced")
+        else:
+            r.warnings.append("Port 9999 not explicitly referenced")
+
+    # ── c08_globe3d Tests (MOST CRITICAL) ─────────────────────────────────────
+
+    def _test_c08_globe3d(self, code: str, r: TestResult):
+        # _update_fig1 must be defined
+        if '_update_fig1' in code:
+            r.passes.append("_update_fig1 defined")
+        else:
+            r.failures.append("Missing: _update_fig1 — globe rendering function")
+
+        # Wayland fix: ax3d.cla() must be called each frame
+        if '.cla()' in code:
+            r.passes.append("ax3d.cla() called (Wayland fix)")
+        else:
+            r.failures.append("Missing: ax3d.cla() — required for Wayland rendering")
+
+        # view_init must be called each frame
+        if 'view_init' in code:
+            r.passes.append("view_init() called each frame")
+        else:
+            r.failures.append("Missing: view_init() — globe won't render without it")
+
+        # set_facecolor must be reset
+        if 'set_facecolor' in code or 'facecolor' in code:
+            r.passes.append("facecolor set")
+        else:
+            r.warnings.append("facecolor not set — may show white background")
+
+        # set_axis_off
+        if 'set_axis_off' in code:
+            r.passes.append("set_axis_off() called")
+        else:
+            r.warnings.append("set_axis_off() not called — axis ticks may show")
+
+        # Node scatter must be present
+        if 'scatter' in code:
+            r.passes.append("scatter() calls present (node rendering)")
+        else:
+            r.failures.append("Missing: scatter() — nodes won't render")
+
+        # Edge rendering
+        if 'GLOBE' in code and 'plot' in code:
+            r.passes.append("Edge rendering present")
+        else:
+            r.warnings.append("Edge rendering may be missing")
+
+        # Auto-spin
+        if 'azim' in code:
+            r.passes.append("Auto-spin azimuth rotation present")
+        else:
+            r.warnings.append("Auto-spin not found")
+
+        # No plt.show() blocking call
+        if 'plt.show()' in code:
+            r.failures.append("plt.show() in update function — will block animation")
+
+        # v9.1 — persistent zoom via ax.dist
+        if 'self.dist' in code or 'ax3d.dist' in code:
+            r.passes.append("ax.dist zoom present (Wayland zoom fix)")
+        else:
+            r.warnings.append("ax.dist missing — zoom resets every frame after cla()")
+
+        # v9.1 — 4 view modes
+        if 'view_mode' in code:
+            r.passes.append("view_mode present (4 render modes)")
+        else:
+            r.warnings.append("view_mode missing — only single render mode")
+
+    # ── c09_metrics Tests ─────────────────────────────────────────────────────
+
+    def _test_c09_metrics(self, code: str, r: TestResult):
+        if '_update_fig2' in code:
+            r.passes.append("_update_fig2 defined")
+        else:
+            r.failures.append("Missing: _update_fig2")
+
+        # Check for key metric displays
+        for metric in ['cv', 'negfrac', 'reward']:
+            if metric in code:
+                r.passes.append(f"Metric displayed: {metric}")
+            else:
+                r.warnings.append(f"Metric not displayed: {metric}")
+
+        if 'ax_reward' in code or 'reward_history' in code:
+            r.passes.append("Reward history chart present")
+        else:
+            r.warnings.append("Reward history chart not found")
+
+        if 'ax_pcmbar' in code or 'PCM' in code:
+            r.passes.append("PCM bar chart present")
+        else:
+            r.warnings.append("PCM bar chart not found")
+
+        # Text rendering — must use ax.text()
+        if '.text(' in code:
+            r.passes.append("ax.text() calls present")
+        else:
+            r.failures.append("Missing: ax.text() — no text will render in metrics")
+
+    # ── c11_controls Tests ────────────────────────────────────────────────────
+
+    def _test_c11_controls(self, code: str, r: TestResult):
+        for fn in ['_on_press', '_on_release', '_on_motion', '_on_key']:
+            if fn in code:
+                r.passes.append(f"Handler defined: {fn}")
+            else:
+                r.failures.append(f"Missing handler: {fn}")
+
+        if 'spinning' in code:
+            r.passes.append("Auto-spin control present")
+        else:
+            r.warnings.append("Auto-spin state not found")
+
+        if 'azim' in code:
+            r.passes.append("Azimuth rotation in controls")
+        else:
+            r.warnings.append("Azimuth not modified in controls")
+
+        # v9.1 — scroll zoom via self.dist
+        if '_on_scroll' in code:
+            r.passes.append("_on_scroll handler present (scroll zoom)")
+        else:
+            r.warnings.append("_on_scroll missing — no scroll zoom")
+
+        if 'self.dist' in code:
+            r.passes.append("self.dist zoom state present")
+        else:
+            r.warnings.append("self.dist missing — zoom not persistent")
+
+        # v9.1 — view mode cycling via 'v' key
+        if 'view_mode' in code:
+            r.passes.append("view_mode cycling present ('v' key)")
+        else:
+            r.warnings.append("view_mode missing — 4 view modes not wired to controls")
+
+    # ── c12_visualizer Tests ──────────────────────────────────────────────────
+
+    def _test_c12_visualizer(self, code: str, r: TestResult):
+        if 'QCAIVisualizer' in code:
+            r.passes.append("QCAIVisualizer class/def present")
+        else:
+            r.failures.append("Missing: QCAIVisualizer")
+
+        if 'FuncAnimation' in code or 'FuncAnim' in code:
+            r.passes.append("FuncAnimation setup present")
+        else:
+            r.failures.append("Missing: FuncAnimation — no animation will run")
+
+        if 'blit=False' in code:
+            r.passes.append("blit=False set (required for multi-axes)")
+        else:
+            r.warnings.append("blit not set — should be False for multi-axes")
+
+        if 'fig1' in code and 'fig2' in code:
+            r.passes.append("Two figure windows defined")
+        else:
+            r.warnings.append("Expected two figures (fig1 and fig2)")
+
+        # Mouse event connections
+        if 'mpl_connect' in code:
+            r.passes.append("Mouse events connected")
+        else:
+            r.failures.append("Missing: mpl_connect — no mouse interaction")
+
+    # ── c10_nodeoutput Tests ──────────────────────────────────────────────────
+
+    def _test_c10_nodeoutput(self, code: str, r: TestResult):
+        if 'show' in code:
+            r.passes.append("show() method present")
+        else:
+            r.warnings.append("show() method not found")
+
+        if 'plt.show()' in code:
+            r.passes.append("plt.show() in entry method")
+        else:
+            r.warnings.append("plt.show() not found in show()")
+
+    # ── c13_main Tests ────────────────────────────────────────────────────────
+
+    def _test_c13_main(self, code: str, r: TestResult):
+        if '__name__' in code and '__main__' in code:
+            r.passes.append("if __name__ == '__main__' present")
+        else:
+            r.failures.append("Missing: if __name__ == '__main__'")
+
+        if 'assert len(GLOBE)' in code:
+            r.passes.append("GLOBE assertion in main")
+        else:
+            r.failures.append("Missing: assert len(GLOBE) == 36 in main")
+
+        if 'QCAISystem()' in code or 'system = ' in code:
+            r.passes.append("QCAISystem instantiation present")
+        else:
+            r.failures.append("Missing: QCAISystem instantiation")
+
+        if 'QCAIVisualizer' in code:
+            r.passes.append("QCAIVisualizer instantiation present")
+        else:
+            r.failures.append("Missing: QCAIVisualizer instantiation")
+
+    # ── Feedback Formatter ────────────────────────────────────────────────────
+
+    def _format_feedback(self, name: str, r: TestResult) -> str:
+        """Format test results as clear feedback for the Builder."""
+        from component_manager import COMPONENT_DESCRIPTIONS
+
+        lines = [
+            f"TESTER REPORT — {name}",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"Result: {'✅ PASS' if r.passed else '❌ FAIL'}",
+            f"Score:  {r.score}/100",
+            f"Lines:  {r.lines}",
+            f"",
+            f"Component: {COMPONENT_DESCRIPTIONS.get(name, name)}",
+        ]
+
+        if r.failures:
+            lines.append(f"\n❌ FAILURES ({len(r.failures)}) — must fix:")
+            for f in r.failures:
+                lines.append(f"  • {f}")
+
+        if r.warnings:
+            lines.append(f"\n⚠️  WARNINGS ({len(r.warnings)}) — should fix:")
+            for w in r.warnings:
+                lines.append(f"  • {w}")
+
+        if r.passes:
+            lines.append(f"\n✅ PASSING ({len(r.passes)}):")
+            for p in r.passes[:5]:   # show first 5 only
+                lines.append(f"  • {p}")
+            if len(r.passes) > 5:
+                lines.append(f"  ... and {len(r.passes)-5} more")
+
+        if not r.passed:
+            lines.append(f"\n📋 WHAT TO FIX:")
+            for f in r.failures[:3]:
+                lines.append(f"  → {f}")
+
+        return "\n".join(lines)
+
+    def batch_test(self,
+                   components: Dict[str, str]
+                   ) -> Dict[str, TestResult]:
+        """Test multiple components. Returns {name: TestResult}."""
+        results = {}
+        for name, code in components.items():
+            results[name] = self.test(name, code)
+            status = "✅ PASS" if results[name].passed else "❌ FAIL"
+            log.info(f"Test {name}: {status} ({results[name].score}/100)")
+        return results

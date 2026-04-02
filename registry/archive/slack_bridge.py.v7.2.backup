@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""
+OpenJarvis Slack Bridge v7.2 — File Mode + Versioning + Agent Folders
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Workspace structure:
+  workspace/
+    current_task.md         ← input
+    intake_brief.md         ← latest
+    prime_plan.md           ← latest
+    builder_code.py         ← latest
+    physics_report.md       ← latest
+    qcai_3d.py              ← latest runnable
+
+    versions/
+      intake/loop_NNN_intake.md
+      prime/loop_NNN_prime.md
+      builder/loop_NNN_builder.py
+      physics/loop_NNN_physics.md + loop_NNN_physics.py
+      output/loop_NNN_qcai_3d.py
+
+    checkpoints/
+      best_score_N.py       ← auto when Prime >= 8
+      best_physics_pass.py  ← auto when Physics PASS
+      manual_*.py           ← CHECKPOINT command
+
+    logs/
+      CHANGELOG.md          ← one line per loop
+      metrics_log.jsonl     ← live ring time-series
+      SUMMARY.md            ← Physics summary per loop
+
+Commands: STOP|PAUSE|RESUME|SHIP IT|STATUS|PULL_DATA
+Files:    LOAD_TASK|SHOW_BRIEF|SHOW_CODE|SHOW_PHYSICS|SHOW_OUTPUT
+Version:  ROLLBACK <N>|CHECKPOINT|SHOW_VERSION <N>|BEST|CHANGELOG
+"""
+
+import os, re, time, threading, logging, requests, json, shutil
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import deque
+from datetime import datetime
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+OPENJARVIS_API       = "http://127.0.0.1:8000"
+MODEL                = "qwen3.5:9b-qcai"
+SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN      = os.environ.get("SLACK_APP_TOKEN")
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
+
+DATA_CHANNEL_ID    = "C0APESL1AVD"
+INTAKE_CHANNEL_ID  = "C0APZ5V9FHA"
+PRIME_CHANNEL_ID   = "C0AQPRZCB16"
+BUILD_CHANNEL_ID   = "C0AQQ11MPKJ"
+PHYSICS_CHANNEL_ID = "C0AQQE69AGY"
+AGENT_CHANNELS     = [INTAKE_CHANNEL_ID, PRIME_CHANNEL_ID,
+                      BUILD_CHANNEL_ID,  PHYSICS_CHANNEL_ID]
+ALL_CHANNELS       = [DATA_CHANNEL_ID] + AGENT_CHANNELS
+
+# ─── Workspace Layout ─────────────────────────────────────────────────────────
+
+WS_ROOT = "/var/home/kmonette/OpenJarvis/workspace"
+
+WS = {
+    "task":    f"{WS_ROOT}/current_task.md",
+    "intake":  f"{WS_ROOT}/intake_brief.md",
+    "prime":   f"{WS_ROOT}/prime_plan.md",
+    "builder": f"{WS_ROOT}/builder_code.py",
+    "physics": f"{WS_ROOT}/physics_report.md",
+    "output":  f"{WS_ROOT}/qcai_3d.py",
+}
+
+VER = {
+    "intake":  f"{WS_ROOT}/versions/intake",
+    "prime":   f"{WS_ROOT}/versions/prime",
+    "builder": f"{WS_ROOT}/versions/builder",
+    "physics": f"{WS_ROOT}/versions/physics",
+    "output":  f"{WS_ROOT}/versions/output",
+}
+
+CKPT_DIR     = f"{WS_ROOT}/checkpoints"
+LOG_DIR      = f"{WS_ROOT}/logs"
+CHANGELOG    = f"{LOG_DIR}/CHANGELOG.md"
+METRICS_LOG  = f"{LOG_DIR}/metrics_log.jsonl"
+SUMMARY_LOG  = f"{LOG_DIR}/SUMMARY.md"
+
+def ws_init():
+    """Create full workspace directory structure."""
+    for path in [WS_ROOT, CKPT_DIR, LOG_DIR] + list(VER.values()):
+        os.makedirs(path, exist_ok=True)
+    # Initialize logs if they don't exist
+    for f, header in [
+        (CHANGELOG, "# QCAI Agent Loop — Changelog\n\n"),
+        (SUMMARY_LOG, "# QCAI Physics Summary Log\n\n"),
+    ]:
+        if not os.path.exists(f):
+            with open(f, "w") as fp: fp.write(header)
+
+def ws_read(key: str) -> str:
+    path = WS.get(key, f"{WS_ROOT}/{key}")
+    try:
+        with open(path, "r") as f: return f.read()
+    except FileNotFoundError: return f"[File not found: {path}]"
+    except Exception as e: return f"[Error: {e}]"
+
+def ws_write(key: str, content: str) -> bool:
+    path = WS.get(key, f"{WS_ROOT}/{key}")
+    try:
+        with open(path, "w") as f: f.write(content)
+        log.info(f"Written: {os.path.basename(path)} ({len(content)} chars)")
+        return True
+    except Exception as e:
+        log.error(f"Write failed {path}: {e}"); return False
+
+def ver_write(agent: str, loop: int, content: str, ext: str = None):
+    """Write versioned copy to agent's version folder."""
+    exts = {"intake":"md","prime":"md","builder":"py",
+             "physics":"md","output":"py"}
+    if ext is None: ext = exts.get(agent, "txt")
+    n    = f"{loop:03d}"
+    path = f"{VER[agent]}/loop_{n}_{agent}.{ext}"
+    try:
+        with open(path, "w") as f: f.write(content)
+        log.info(f"Version saved: {os.path.basename(path)}")
+    except Exception as e:
+        log.error(f"Version write failed: {e}")
+
+def ver_read(agent: str, loop: int) -> str:
+    """Read a specific loop version for an agent."""
+    exts = {"intake":"md","prime":"md","builder":"py",
+             "physics":"py","output":"py"}
+    ext  = exts.get(agent, "txt")
+    n    = f"{loop:03d}"
+    path = f"{VER[agent]}/loop_{n}_{agent}.{ext}"
+    try:
+        with open(path, "r") as f: return f.read()
+    except FileNotFoundError:
+        # Try alternate extension
+        for e in ["md","py","txt"]:
+            p2 = f"{VER[agent]}/loop_{n}_{agent}.{e}"
+            if os.path.exists(p2):
+                with open(p2, "r") as f: return f.read()
+        return f"[Version not found: loop {loop} {agent}]"
+    except Exception as e: return f"[Error: {e}]"
+
+def ckpt_save(name: str, content: str):
+    """Save a checkpoint."""
+    path = f"{CKPT_DIR}/{name}.py"
+    try:
+        with open(path, "w") as f: f.write(content)
+        log.info(f"Checkpoint: {name}.py")
+    except Exception as e: log.error(f"Checkpoint failed: {e}")
+
+def ckpt_read(name: str) -> str:
+    path = f"{CKPT_DIR}/{name}.py"
+    try:
+        with open(path, "r") as f: return f.read()
+    except: return f"[Checkpoint not found: {name}]"
+
+def changelog_append(loop: int, score: int, physics_status: str,
+                     lines: int, summary: str):
+    """Append one line to the changelog."""
+    ts   = datetime.now().strftime("%Y-%m-%d %H:%M")
+    line = (f"| {loop:3d} | {ts} | Score:{score:2d}/10 | "
+            f"Physics:{physics_status:<7} | Lines:{lines:4d} | {summary} |\n")
+    try:
+        with open(CHANGELOG, "a") as f: f.write(line)
+    except Exception as e: log.error(f"Changelog: {e}")
+
+def summary_append(loop: int, report: str):
+    """Append physics summary to SUMMARY.md."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        with open(SUMMARY_LOG, "a") as f:
+            f.write(f"\n## Loop {loop} — {ts}\n\n{report[:500]}\n\n---\n")
+    except Exception as e: log.error(f"Summary: {e}")
+
+def metrics_append(data: dict):
+    """Append quantum metrics snapshot to jsonl log."""
+    data["timestamp"] = datetime.now().isoformat()
+    try:
+        with open(METRICS_LOG, "a") as f:
+            f.write(json.dumps(data) + "\n")
+    except Exception as e: log.error(f"Metrics log: {e}")
+
+def list_versions(agent: str) -> str:
+    """List available versions for an agent."""
+    folder = VER.get(agent, "")
+    if not folder or not os.path.exists(folder):
+        return f"No versions folder for {agent}"
+    files = sorted(os.listdir(folder))
+    if not files: return f"No versions yet for {agent}"
+    return "\n".join(f"  {f}" for f in files[-10:])  # last 10
+
+def extract_code(text: str) -> str:
+    match = re.search(r"```python\n(.*?)```", text, re.DOTALL)
+    if match: return match.group(1)
+    match = re.search(r"```\n(.*?)```", text, re.DOTALL)
+    if match: return match.group(1)
+    return text
+
+def extract_score(text: str) -> int:
+    m = re.search(r"QUALITY SCORE:\s*(\d+)/10", text)
+    return int(m.group(1)) if m else 0
+
+def extract_physics_status(text: str) -> str:
+    m = re.search(r"PHYSICS STATUS:\s*(PASS|FAIL|PARTIAL)", text)
+    return m.group(1) if m else "UNKNOWN"
+
+# ─── Mission Context ──────────────────────────────────────────────────────────
+
+MISSION = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MISSION: QCAI — Quantum-Classical Co-Evolutionary AI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHO:    Kevin Monette, independent researcher, Clarksville TN.
+WHAT:   Genuine quantum mechanical dynamics (BCP, PCM, density matrices,
+        von Neumann entropy) as a live layer inside classical PyTorch.
+        No quantum hardware. cv=1.0, negfrac=1.0, nc=12/12.
+WHY:    Different scaling axis for AI. Infinite qubits at cost of RAM.
+        Physics as reward signal. Self-healing. Self-monitoring.
+AUDIENCE: Dr. Hanna Terletska (MTSU QRISE) + Prof. B. Alex King III (Austin Peay)
+DEMO STANDARD: Explainable to a physicist on first viewing.
+YOUR GOAL: Improve and train the quantum AI nodes. Stress-test physics.
+        Build tools that make the system more capable and impressive.
+DATA: Type PULL_DATA for live ring context. [QUANTUM_CONTEXT_UPDATE]
+      messages are telemetry — absorb as context, not as new tasks.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+PHYSICS_GT = """
+GROUND TRUTH PHYSICS (invariant):
+  ss(ph)=([1,exp(i*ph)]/sqrt(2))
+  pof(p)=angle(p[0]*conj(p[1]))%2pi
+  pcm=-|p0*p1*sqrt(2)|^2*0.5*(1-rz^2)  rz=|p0|^2-|p1|^2
+  BCP: U=alpha*CNOT+(1-alpha)*I  alpha=0.40
+       rA=rho.reshape(2,2,2,2).trace(1,3)
+       rB=rho.reshape(2,2,2,2).trace(0,2)
+  GLOBE: set(sorted([i,(i+d)%12]) for d in [1,2,5]) — exactly 36 edges
+  cv=1-|mean(exp(i*phases))|  TARGET=1.0
+  negfrac=sum(pcm<-0.05)/12   TARGET=1.0
+  REWARD=coherence+1/(1+entropy)
+  HEAL: pcm>=0.05 → home[i]=i*2pi/12
+  NODES: Omega Guardian Sentinel Nexus Storm Sora Echo Iris Sage Kevin Atlas Void
+"""
+
+# ─── Loop State ───────────────────────────────────────────────────────────────
+
+class LoopState:
+    def __init__(self):
+        self.running=False; self.paused=False; self.loop_count=0
+        self.last_intake=self.last_prime=""
+        self.last_build=self.last_physics=""
+        self.original_request=""
+        self.quantum_data={}
+        self.data_history=deque(maxlen=10)
+        self.best_score=0
+        self.lock=threading.Lock()
+
+    def reset(self):
+        self.running=False; self.paused=False; self.loop_count=0
+        self.last_intake=self.last_prime=""
+        self.last_build=self.last_physics=""
+        self.original_request=""
+
+state = LoopState()
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("jarvis")
+app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+
+# ─── Quantum Data ─────────────────────────────────────────────────────────────
+
+def fmt_qdata(full=False) -> str:
+    d = state.quantum_data
+    if not d: return "  [no live data — run qcai_3d.py or qcai_trainer.py]"
+    lines = [
+        f"  step={d.get('step',0)}  cv={d.get('cv',0):.4f}  "
+        f"negfrac={d.get('negfrac',0):.4f}  nc={d.get('nc_count',0)}/12",
+        f"  PCM={d.get('mean_pcm',0):+.4f}  coh={d.get('coherence',0):.4f}  "
+        f"ent={d.get('entropy',0):.4f}  R={d.get('reward',0):.4f}",
+    ]
+    if full:
+        nn = ["Omega","Guardian","Sentinel","Nexus","Storm","Sora",
+              "Echo","Iris","Sage","Kevin","Atlas","Void"]
+        outputs = d.get("node_outputs",[])
+        domains = d.get("domains",[])
+        if outputs:
+            lines.append("  Nodes:")
+            for i,(name,out) in enumerate(zip(nn,outputs)):
+                dom = domains[i] if i<len(domains) else "?"
+                lines.append(f"    {name:<8}[{dom:<12}] {out}")
+    return "\n".join(lines)
+
+def build_pull_response() -> str:
+    d = state.quantum_data
+    if not d: return "⚛️ No live data. Start qcai_3d.py or qcai_trainer.py."
+    nn = ["Omega","Guardian","Sentinel","Nexus","Storm","Sora",
+          "Echo","Iris","Sage","Kevin","Atlas","Void"]
+    pcms    = d.get("pcms",    [0]*12)
+    phases  = d.get("phases",  [0]*12)
+    outputs = d.get("node_outputs",[""]*12)
+    domains = d.get("domains", ["?"]*12)
+    def gl(p):
+        return "🟢" if p<-0.15 else "🟡" if p<-0.05 else "🟠" if p<0.05 else "🔴"
+    node_lines = "\n".join(
+        f"{gl(pcms[i])} {nn[i]:<8} PCM={pcms[i]:+.3f} "
+        f"φ={phases[i]:.2f} [{domains[i] if i<len(domains) else '?':<12}] "
+        f"\"{outputs[i] if i<len(outputs) else ''}\""
+        for i in range(min(12,len(pcms))))
+    trend=""
+    if len(state.data_history)>=2:
+        r0=state.data_history[-2].get("reward",0)
+        r1=state.data_history[-1].get("reward",0)
+        trend=f"  trend:{r0:.4f}→{r1:.4f}{'↑' if r1>r0 else '↓'}"
+    return (
+        f"[QUANTUM_CONTEXT_UPDATE] Step {d.get('step',0)}\n"
+        f"```\ncv={d.get('cv',0):.4f}  nf={d.get('negfrac',0):.4f}  "
+        f"nc={d.get('nc_count',0)}/12  R={d.get('reward',0):.4f}{trend}\n```\n"
+        f"*Nodes:*\n```\n{node_lines}\n```\n"
+        f"_Type PULL_DATA again for updated snapshot._"
+    )
+
+# ─── System Prompts ───────────────────────────────────────────────────────────
+
+def make_intake_prompt(loop, has_code):
+    return f"""{MISSION}
+You are OpenJarvis Intake — information refinery, gap detector, task decomposer,
+and quantum AI training coach. Loop {loop}.
+
+Live ring: {fmt_qdata()}
+
+{"Review physics-validated code from file. Find remaining gaps. Check if nodes improved." if has_code else "Generate initial structured brief from task specification."}
+
+INTAKE BRIEF [Loop {loop}]
+━━━━━━━━━━━━━━━━━━━━
+CONDENSED SUMMARY: [what is being built and why]
+CATEGORY: [TECHNICAL/TRAINING/PHYSICS/VISUALIZATION]
+DEMO READINESS: [not started / in progress / nearly ready / ready]
+TRAINING STATUS: [what nodes are learning based on live ring data]
+
+KNOWN FACTS:
+- [fact]
+
+OPEN QUESTIONS:
+- [question a physicist would ask]
+
+RISKS:
+- [risk]
+
+MICROTASKS:
+1. [task with physics spec]
+   1a. [subtask]
+
+PHYSICS VALIDATION NEEDED:
+- [formula or behavior to verify]
+
+STRESS TESTS:
+- [specific stress test]
+
+RECOMMENDED NEXT ACTION:
+[one sentence for Prime]
+━━━━━━━━━━━━━━━━━━━━"""
+
+def make_prime_prompt(loop):
+    return f"""{MISSION}
+You are OpenJarvis Prime — execution planner, quality judge, demo readiness assessor.
+Loop {loop}.
+
+Live ring: {fmt_qdata()}
+
+PRIME RESPONSE [Loop {loop}]
+━━━━━━━━━━━━━━━━━━━━
+GOAL: [one sentence]
+QUALITY SCORE: [X/10] — [reason referencing demo standard]
+DEMO READINESS: [not started / in progress / nearly ready / ready]
+TRAINING HEALTH: [are nodes improving based on live data?]
+
+EXECUTION PLAN:
+1. [Step — specific, actionable, physics-aware]
+2. [Step]
+3. [Step]
+
+STRESS TEST PLAN:
+- [what to break and measure]
+
+BUILDER INSTRUCTIONS:
+[Precise — exact functions/variables. Physics comments mandatory.]
+
+PHYSICS CHECKS FOR VALIDATOR:
+- [formula or behavior Physics must verify]
+
+NEXT STEPS:
+- 🔴 [Critical]
+- 🟡 [Important]
+- 🟢 [Nice to have]
+━━━━━━━━━━━━━━━━━━━━"""
+
+BUILDER_PROMPT = f"""{MISSION}
+You are OpenJarvis Builder — physicist-readable Python code writer.
+
+Rules:
+- ONLY Python code — no prose before or after
+- Every physics operation gets a comment: WHAT it computes and WHY
+- Complete and runnable as-is on GTX 1070, matplotlib TkAgg, Python 3.13
+- Include assertions for physics correctness (assert len(GLOBE)==36 etc)
+- Dr. Hanna Terletska must understand the physics from comments alone
+
+Start: ```python
+End:   ```"""
+
+PHYSICS_PROMPT = f"""{MISSION}
+{PHYSICS_GT}
+You are OpenJarvis Physics — quantum physics guardian, validator, stress tester.
+
+PHYSICS VALIDATION REPORT [Loop {{loop}}]
+━━━━━━━━━━━━━━━━━━━━
+PHYSICS STATUS: [PASS / FAIL / PARTIAL]
+DEMO READINESS: [not started / in progress / nearly ready / ready]
+
+VIOLATIONS FOUND:
+- [violation → correct formula → why it matters physically]
+
+STRESS TEST RESULTS:
+- [what was tested, what broke, what held]
+
+CORRECTIONS APPLIED:
+- [correction with physical explanation]
+
+VERIFIED:
+- Globe 36 edges: [YES/NO]
+- BCP formula correct: [YES/NO]
+- PCM via density matrix: [YES/NO]
+- cv = 1-|mean(exp(i*phases))|: [YES/NO]
+- Reward = coherence+1/(1+entropy): [YES/NO]
+- Self-healing on RED nodes: [YES/NO]
+- Node outputs coherent with domain: [YES/NO]
+
+LOOP SUMMARY:
+[2-3 sentences: what improved this loop, what still needs work]
+
+CORRECTED CODE:
+```python
+[complete corrected implementation]
+```
+━━━━━━━━━━━━━━━━━━━━"""
+
+# ─── Inference ────────────────────────────────────────────────────────────────
+
+def infer(system_prompt, user_message, temperature=0.15, max_tokens=2000):
+    try:
+        resp = requests.post(
+            f"{OPENJARVIS_API}/v1/chat/completions",
+            json={"model":MODEL,
+                  "messages":[{"role":"system","content":system_prompt},
+                               {"role":"user","content":user_message}],
+                  "max_tokens":max_tokens,"temperature":temperature},
+            timeout=300)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except requests.exceptions.Timeout: return "⏱ Timed out."
+    except Exception as e:
+        log.error(f"Infer: {e}"); return f"❌ {e}"
+
+# ─── Slack Helpers ────────────────────────────────────────────────────────────
+
+def post(ch, text):
+    try: return app.client.chat_postMessage(channel=ch, text=text)
+    except Exception as e: log.error(f"Post failed: {e}"); return {}
+
+def update(ch, ts, text):
+    try: app.client.chat_update(channel=ch, ts=ts, text=text)
+    except Exception as e: log.error(f"Update failed: {e}")
+
+def post_agents(text):
+    for ch in AGENT_CHANNELS: post(ch, text)
+
+# ─── Loop Control + File Commands ─────────────────────────────────────────────
+
+def wait_if_paused():
+    while state.paused:
+        if not state.running: return False
+        time.sleep(1)
+    return state.running
+
+def handle_control(text, source_channel=None):
+    raw = text.strip()
+    cmd = raw.upper()
+    ch  = source_channel or PHYSICS_CHANNEL_ID
+
+    # ── Standard loop commands ──
+    if cmd == "STOP":
+        with state.lock: state.running=False; state.paused=False
+        post_agents("🛑 *Loop stopped.* Drop new request in #jarvis-intake.")
+        return True
+    if cmd == "PAUSE":
+        with state.lock: state.paused=True
+        post_agents("⏸ *Paused.* Type RESUME.")
+        return True
+    if cmd == "RESUME":
+        with state.lock: state.paused=False
+        post_agents("▶️ *Resumed.*")
+        return True
+    if cmd == "SHIP IT":
+        with state.lock: state.running=False
+        code = ws_read("output")
+        lines = code.count('\n')
+        post(PHYSICS_CHANNEL_ID,
+             f"🚀 *FINAL — qcai_3d.py ({lines} lines)*\n"
+             f"```python\n{code[:2000]}\n```\n"
+             f"_Full file: `workspace/qcai_3d.py`_")
+        post_agents("✅ *Shipped. File at workspace/qcai_3d.py*")
+        return True
+    if cmd == "STATUS":
+        # List recent versions
+        out_vers = list_versions("output")
+        post_agents(
+            f"📊 *Loop {state.loop_count}* | "
+            f"Running:{state.running} Paused:{state.paused}\n"
+            f"⚛️ {fmt_qdata()}\n"
+            f"📁 Recent output versions:\n{out_vers}")
+        return True
+    if cmd == "PULL_DATA":
+        post(ch, build_pull_response())
+        return True
+
+    # ── File commands ──
+    if cmd == "LOAD_TASK":
+        content = ws_read("task")
+        if "[File not found" in content:
+            post(ch, f"❌ No task file at `{WS['task']}`")
+        else:
+            preview = content[:300]+"..." if len(content)>300 else content
+            post(ch, f"📋 *Task loaded* ({len(content)} chars)\n"
+                     f"```\n{preview}\n```\n_Starting loop..._")
+            if not state.running:
+                threading.Thread(target=run_loop,
+                                 args=("[LOAD_TASK]",), daemon=True).start()
+            else:
+                post(ch, "⚠️ Loop running. Type STOP first.")
+        return True
+    if cmd == "SHOW_BRIEF":
+        c=ws_read("intake")
+        post(ch,f"📋 *intake_brief.md*\n```\n{c[:2000]}\n```")
+        return True
+    if cmd == "SHOW_CODE":
+        c=ws_read("output")
+        post(ch,f"💻 *qcai_3d.py* ({c.count(chr(10))} lines)\n"
+                f"```python\n{c[:2000]}\n```")
+        return True
+    if cmd == "SHOW_PHYSICS":
+        c=ws_read("physics")
+        post(ch,f"⚛️ *physics_report.md*\n```\n{c[:2000]}\n```")
+        return True
+    if cmd == "SHOW_OUTPUT":
+        c=ws_read("output")
+        post(ch,f"🚀 *qcai_3d.py* ({c.count(chr(10))} lines)\n"
+                f"```python\n{c[:3000]}\n```")
+        return True
+    if cmd.startswith("READ_FILE "):
+        fname=raw[10:].strip()
+        c=ws_read(fname)
+        post(ch,f"📄 *{fname}*\n```\n{c[:2000]}\n```")
+        return True
+
+    # ── Version commands ──
+    if cmd == "CHANGELOG":
+        c = ws_read(CHANGELOG) if os.path.exists(CHANGELOG) else "No changelog yet."
+        post(ch, f"📜 *Changelog*\n```\n{c[-2000:]}\n```")
+        return True
+    if cmd == "CHECKPOINT":
+        code = ws_read("output")
+        if "[File not found" in code:
+            post(ch, "❌ No output file to checkpoint.")
+        else:
+            name = f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            ckpt_save(name, code)
+            post(ch, f"✅ *Checkpoint saved:* `checkpoints/{name}.py`")
+        return True
+    if cmd == "BEST":
+        # Find best scored checkpoint
+        best = ckpt_read("best_score_auto")
+        if "[Checkpoint not found" in best:
+            post(ch, "❌ No best checkpoint yet. Loop needs to score ≥8.")
+        else:
+            ws_write("output", best)
+            lines = best.count('\n')
+            post(ch, f"✅ *Best checkpoint restored to qcai_3d.py* ({lines} lines)")
+        return True
+    if cmd.startswith("ROLLBACK "):
+        try:
+            n = int(raw.split()[1])
+            code = ver_read("output", n)
+            if "[Version not found" in code:
+                post(ch, f"❌ No output version for loop {n}")
+            else:
+                ws_write("output", code)
+                lines = code.count('\n')
+                post(ch, f"✅ *Rolled back to loop {n}* ({lines} lines) → qcai_3d.py")
+        except (ValueError, IndexError):
+            post(ch, "❌ Usage: `ROLLBACK <loop_number>`")
+        return True
+    if cmd.startswith("SHOW_VERSION "):
+        try:
+            parts = raw.split()
+            n     = int(parts[1])
+            agent = parts[2].lower() if len(parts)>2 else "output"
+            code  = ver_read(agent, n)
+            post(ch, f"📄 *Loop {n} — {agent}*\n```\n{code[:2000]}\n```")
+        except (ValueError, IndexError):
+            post(ch, "❌ Usage: `SHOW_VERSION <loop> [agent]`\n"
+                     "Agents: intake prime builder physics output")
+        return True
+    if cmd.startswith("LIST_VERSIONS"):
+        parts  = raw.split()
+        agent  = parts[1].lower() if len(parts)>1 else "output"
+        listing= list_versions(agent)
+        post(ch, f"📁 *versions/{agent}/*\n```\n{listing}\n```")
+        return True
+
+    return False
+
+# ─── Main Loop ────────────────────────────────────────────────────────────────
+
+def run_loop(initial_input):
+    with state.lock:
+        state.running=True; state.paused=False; state.loop_count=0
+        state.original_request=initial_input
+        state.last_build=""; state.last_physics=""
+
+    ws_init()
+    task_txt = ws_read("task")
+    if "[File not found" in task_txt:
+        task_txt = initial_input
+        ws_write("task", initial_input)
+
+    log.info(f"Loop start: {initial_input[:60]}...")
+    post_agents(
+        f"🔄 *Sovereign Quad-Agent Loop v7.2 — Versioned File Mode*\n"
+        f"Intake→Prime→Builder→Physics→repeat\n"
+        f"Workspace: `{WS_ROOT}`\n"
+        f"Each loop saves versioned files per agent.\n"
+        f"Commands: `STOP` `PAUSE` `RESUME` `SHIP IT` `STATUS` `PULL_DATA`\n"
+        f"Files: `LOAD_TASK` `SHOW_BRIEF` `SHOW_CODE` `SHOW_OUTPUT`\n"
+        f"Versions: `ROLLBACK <N>` `CHECKPOINT` `BEST` `CHANGELOG` `LIST_VERSIONS`"
+    )
+
+    while state.running:
+        state.loop_count += 1
+        loop     = state.loop_count
+        has_code = bool(state.last_physics or state.last_build)
+
+        if not wait_if_paused(): break
+
+        # ══ INTAKE ═══════════════════════════════════════════════
+        prev_code = ws_read("output") if has_code else ""
+        usr_in = (
+            f"FULL TASK SPEC:\n{task_txt}\n\n"
+            f"PREVIOUS qcai_3d.py:\n"
+            f"{prev_code[:3000] if '[File not found' not in prev_code else 'None'}\n\n"
+            f"LIVE RING:\n{fmt_qdata(full=True)}\n\n"
+            f"Generate improvement brief for loop {loop}."
+        ) if has_code else (
+            f"FULL TASK SPEC:\n{task_txt}\n\n"
+            f"LIVE RING:\n{fmt_qdata(full=True)}\n\nGenerate initial brief."
+        )
+
+        t = post(INTAKE_CHANNEL_ID, f"🔄 *[Loop {loop}] Intake...*")
+        out = infer(make_intake_prompt(loop, has_code), usr_in,
+                    temperature=0.15, max_tokens=1500)
+        state.last_intake = out
+        ws_write("intake", f"# Intake Brief — Loop {loop}\n\n{out}")
+        ver_write("intake", loop, out, "md")
+
+        notify = out[:300]+"..." if len(out)>300 else out
+        if t.get("ts"):
+            update(INTAKE_CHANNEL_ID, t["ts"],
+                   f"✅ *[Loop {loop}] Intake done*\n"
+                   f"Files: `intake_brief.md` + `versions/intake/loop_{loop:03d}_intake.md`\n\n"
+                   f"{notify}\n\n_`SHOW_BRIEF` for full_")
+        if not wait_if_paused(): break
+
+        # ══ PRIME ════════════════════════════════════════════════
+        score    = extract_score(state.last_prime)
+        ship_n   = "\n⚠️ Score ≥8 last loop — type SHIP IT to finalize." if score>=8 else ""
+        full_brief = ws_read("intake")
+
+        prime_in = (
+            f"TASK SPEC:\n{task_txt[:800]}\n\n"
+            f"FULL INTAKE BRIEF:\n{full_brief}\n\n"
+            f"PREV CODE SUMMARY:\n"
+            f"{prev_code[:400] if '[File not found' not in prev_code else 'None'}"
+            f"{ship_n}"
+        )
+
+        t2 = post(PRIME_CHANNEL_ID, f"🔄 *[Loop {loop}] Prime...*")
+        out2 = infer(make_prime_prompt(loop), prime_in,
+                     temperature=0.2, max_tokens=2000)
+        state.last_prime = out2
+        ws_write("prime", f"# Prime Plan — Loop {loop}\n\n{out2}")
+        ver_write("prime", loop, out2, "md")
+
+        ns = extract_score(out2)
+        notify2 = out2[:300]+"..." if len(out2)>300 else out2
+        if t2.get("ts"):
+            update(PRIME_CHANNEL_ID, t2["ts"],
+                   f"✅ *[Loop {loop}] Prime done* | Score: {ns}/10\n"
+                   f"Files: `prime_plan.md` + `versions/prime/loop_{loop:03d}_prime.md`\n\n"
+                   f"{notify2}")
+        if ns>=8:
+            post_agents(f"⭐ *[Loop {loop}] Prime scored {ns}/10 — READY TO SHIP*\n"
+                        f"Type `SHIP IT` to finalize or loop continues.")
+        if not wait_if_paused(): break
+
+        # ══ BUILDER ══════════════════════════════════════════════
+        full_prime = ws_read("prime")
+        prev_full  = ws_read("output")
+
+        build_in = (
+            f"FULL PRIME PLAN:\n{full_prime}\n\n"
+            f"TASK SPEC:\n{task_txt[:800]}\n\n"
+            f"PREVIOUS qcai_3d.py (improve this):\n"
+            f"{prev_full[:4000] if '[File not found' not in prev_full else 'None — write from scratch'}"
+        )
+
+        t3 = post(BUILD_CHANNEL_ID, f"🔄 *[Loop {loop}] Builder...*")
+        out3 = infer(BUILDER_PROMPT, build_in, temperature=0.1, max_tokens=2000)
+        state.last_build = out3
+        ws_write("builder", f"# Builder Output — Loop {loop}\n\n{out3}")
+        ver_write("builder", loop, out3, "py")
+
+        code_only = extract_code(out3)
+        if len(code_only) > 100:
+            ws_write("output", code_only)
+            ver_write("output", loop, code_only, "py")
+
+        lines = code_only.count('\n')
+        if t3.get("ts"):
+            update(BUILD_CHANNEL_ID, t3["ts"],
+                   f"✅ *[Loop {loop}] Builder done* | {lines} lines\n"
+                   f"Files: `qcai_3d.py` + `versions/builder/loop_{loop:03d}_builder.py`\n"
+                   f"       `versions/output/loop_{loop:03d}_qcai_3d.py`\n\n"
+                   f"_`SHOW_CODE` to preview_")
+        if not wait_if_paused(): break
+
+        # ══ PHYSICS ══════════════════════════════════════════════
+        ph_sys    = PHYSICS_PROMPT.replace("{loop}", str(loop))
+        full_code = ws_read("output")
+        full_prime_txt = ws_read("prime")
+
+        physics_in = (
+            f"FULL CODE (qcai_3d.py):\n{full_code[:4000]}\n\n"
+            f"PRIME PHYSICS CHECKS:\n{full_prime_txt[:600]}\n\n"
+            f"TASK SPEC:\n{task_txt[:400]}\n\n"
+            f"LIVE RING:\n{fmt_qdata(full=True)}"
+        )
+
+        t4 = post(PHYSICS_CHANNEL_ID, f"🔄 *[Loop {loop}] Physics...*")
+        out4 = infer(ph_sys, physics_in, temperature=0.05, max_tokens=2000)
+        state.last_physics = out4
+        ws_write("physics", f"# Physics Report — Loop {loop}\n\n{out4}")
+        ver_write("physics", loop, out4, "md")
+
+        # Extract and save corrected code
+        corrected = extract_code(out4)
+        phys_status = extract_physics_status(out4)
+        if len(corrected) > 200:
+            ws_write("output", corrected)
+            ver_write("physics", loop, corrected, "py")
+            ver_write("output", loop, corrected, "py")  # overwrite with physics version
+
+        # Auto-checkpoint if Physics PASS or Prime scored ≥8
+        if phys_status == "PASS":
+            ckpt_save("best_physics_pass", corrected if len(corrected)>200 else full_code)
+            post(PHYSICS_CHANNEL_ID, "✅ *Physics PASS — auto-checkpointed as `best_physics_pass.py`*")
+        if ns >= 8 and ns > state.best_score:
+            state.best_score = ns
+            ckpt_save("best_score_auto", corrected if len(corrected)>200 else full_code)
+
+        # Update logs
+        summary_txt = out4[:500]
+        summary_append(loop, summary_txt)
+        changelog_append(loop, ns, phys_status, lines,
+                         f"Physics:{phys_status} Score:{ns}/10")
+        if state.quantum_data:
+            metrics_append({**state.quantum_data, "loop": loop})
+
+        notify4 = out4[:300]+"..." if len(out4)>300 else out4
+        if t4.get("ts"):
+            update(PHYSICS_CHANNEL_ID, t4["ts"],
+                   f"✅ *[Loop {loop}] Physics done* | Status: {phys_status}\n"
+                   f"Files: `physics_report.md` + `versions/physics/loop_{loop:03d}_*`\n"
+                   f"Logs: `CHANGELOG.md` + `SUMMARY.md` updated\n\n"
+                   f"{notify4}\n\n_`SHOW_OUTPUT` for final code_")
+
+        log.info(f"Loop {loop} complete. Score:{ns}/10 Physics:{phys_status}")
+        time.sleep(15)
+
+    log.info("Loop ended.")
+    with state.lock: state.reset()
+
+# ─── Live Feed Listener ───────────────────────────────────────────────────────
+
+def start_feed():
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length",0))
+            body   = self.rfile.read(length)
+            try:
+                d = json.loads(body)
+                state.quantum_data = d
+                state.data_history.append(d)
+                metrics_append(d)  # log every snapshot
+                step = d.get("step",0)
+                if step % 100 == 0 and step > 0:
+                    nn = ["Omega","Guardian","Sentinel","Nexus","Storm","Sora",
+                          "Echo","Iris","Sage","Kevin","Atlas","Void"]
+                    outputs = d.get("node_outputs",[])
+                    domains = d.get("domains",[])
+                    nb = "\n".join(
+                        f"  {nn[i]:<8}[{domains[i] if i<len(domains) else '?':<12}] "
+                        f"PCM={d.get('pcms',[0]*12)[i]:+.3f}  "
+                        f"\"{outputs[i] if i<len(outputs) else ''}\""
+                        for i in range(12)
+                    ) if outputs else "  [no node outputs yet]"
+                    post(DATA_CHANNEL_ID,
+                         f"⚛️ *Step {step}*\n"
+                         f"```\ncv={d.get('cv',0):.4f}  nf={d.get('negfrac',0):.4f}  "
+                         f"nc={d.get('nc_count',0)}/12  R={d.get('reward',0):.4f}\n"
+                         f"{nb}\n```\n_Agents: PULL_DATA for context_")
+            except Exception as e: log.error(f"Feed: {e}")
+            self.send_response(200); self.end_headers()
+        def log_message(self,*a): pass
+    HTTPServer(("127.0.0.1",9999), H).serve_forever()
+
+# ─── Event Handlers ───────────────────────────────────────────────────────────
+
+BOT_USER_ID = ""
+
+@app.event("app_mention")
+def handle_mention(event, client):
+    user = event.get("user","")
+    if user==BOT_USER_ID: return
+    text = re.sub(r"<@[A-Z0-9]+>","",event.get("text","")).strip()
+    if not text: return
+    ch = event.get("channel","")
+    if handle_control(text, source_channel=ch): return
+    if ch not in AGENT_CHANNELS:
+        try:
+            client.chat_postMessage(channel=ch,
+                text=f"✅ QCAI v7.2 loop → <#{INTAKE_CHANNEL_ID}>\n"
+                     f"Data → <#{DATA_CHANNEL_ID}> | Workspace: `{WS_ROOT}`")
+        except Exception: pass
+    if not state.running:
+        threading.Thread(target=run_loop, args=(text,), daemon=True).start()
+    else:
+        post(INTAKE_CHANNEL_ID,"⚠️ Loop running. Type `STOP` first.")
+
+@app.event("message")
+def handle_message(event, client):
+    if event.get("bot_id") or event.get("subtype"): return
+    user = event.get("user","")
+    if user==BOT_USER_ID or not user: return
+    text = event.get("text","").strip()
+    if not text: return
+    if f"<@{BOT_USER_ID}>" in text: return
+    ch = event.get("channel","")
+    if handle_control(text, source_channel=ch): return
+    if ch==INTAKE_CHANNEL_ID:
+        if not state.running:
+            threading.Thread(target=run_loop, args=(text,), daemon=True).start()
+        else:
+            post(INTAKE_CHANNEL_ID,"⚠️ Loop running. Type `STOP` first.")
+
+# ─── Health + Warmup ──────────────────────────────────────────────────────────
+
+def check_api():
+    try:
+        r=requests.get(f"{OPENJARVIS_API}/health",timeout=5)
+        if r.status_code==200: log.info("✅ API healthy"); return True
+    except Exception: pass
+    log.error("❌ API not reachable"); return False
+
+def check_tokens():
+    missing=[k for k in ["SLACK_BOT_TOKEN","SLACK_APP_TOKEN","SLACK_SIGNING_SECRET"]
+             if not os.environ.get(k)]
+    if missing: log.error(f"❌ Missing: {', '.join(missing)}"); return False
+    log.info("✅ Tokens present"); return True
+
+def warm_model():
+    try:
+        requests.post(f"{OPENJARVIS_API}/v1/chat/completions",
+                      json={"model":MODEL,
+                            "messages":[{"role":"user","content":"hi"}],
+                            "max_tokens":5},timeout=60)
+        log.info("✅ Model warmed up")
+    except Exception as e: log.warning(f"Warm-up: {e}")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    log.info("="*60)
+    log.info("OpenJarvis Slack Bridge v7.2")
+    log.info("Versioned File Mode + Agent Folders + Changelog")
+    log.info("="*60)
+    log.info(f"Channels: data={DATA_CHANNEL_ID} intake={INTAKE_CHANNEL_ID}")
+    log.info(f"          prime={PRIME_CHANNEL_ID} build={BUILD_CHANNEL_ID}")
+    log.info(f"          physics={PHYSICS_CHANNEL_ID}")
+    log.info(f"Workspace: {WS_ROOT}")
+    log.info("Commands: STOP|PAUSE|RESUME|SHIP IT|STATUS|PULL_DATA")
+    log.info("Files: LOAD_TASK|SHOW_BRIEF|SHOW_CODE|SHOW_OUTPUT|CHANGELOG")
+    log.info("Versions: ROLLBACK <N>|CHECKPOINT|BEST|LIST_VERSIONS|SHOW_VERSION <N>")
+    log.info("="*60)
+
+    if not check_tokens(): raise SystemExit(1)
+    if not check_api():    raise SystemExit(1)
+
+    try: BOT_USER_ID = app.client.auth_test()["user_id"]
+    except Exception: pass
+    log.info(f"Bot: {BOT_USER_ID}")
+
+    ws_init()
+    log.info(f"Workspace initialized: {WS_ROOT}")
+    threading.Thread(target=start_feed, daemon=True).start()
+    warm_model()
+
+    log.info("Ready.")
+    log.info("  LOAD_TASK — start loop from current_task.md")
+    log.info("  Or drop any message in #jarvis-intake")
+    log.info("="*60)
+
+    SocketModeHandler(app, SLACK_APP_TOKEN).start()

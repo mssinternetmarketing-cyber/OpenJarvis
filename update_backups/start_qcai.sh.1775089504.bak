@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# start_qcai.sh v2.0 — QCAI Bridge Startup Script
+# Supports Ollama-only mode when OpenJarvis API is unavailable.
+# Run this from inside distrobox.
+# Usage: ./start_qcai.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -e
+
+BRIDGE_DIR="/var/home/kmonette/OpenJarvis"
+BRIDGE_FILE="slack_bridge.py"
+ENV_FILE="$BRIDGE_DIR/.env"
+OLLAMA_HOST="192.168.1.183:11434"
+PRIMARY_MODEL="qwen3.5:9b-qcai"
+FALLBACK_MODEL="qwen3-8b-jarvis"   # created from qwen3-8b-jarvis.modelfile
+
+# ── 1. Check bridge file exists ───────────────────────────────────────────────
+if [ ! -f "$BRIDGE_DIR/$BRIDGE_FILE" ]; then
+    echo "❌ Cannot find $BRIDGE_DIR/$BRIDGE_FILE"
+    echo "   Are you inside distrobox? Run: distrobox enter openjarvis-box"
+    exit 1
+fi
+
+# ── 2. Load .env tokens ───────────────────────────────────────────────────────
+if [ ! -f "$ENV_FILE" ]; then
+    echo "❌ Cannot find $ENV_FILE"
+    echo "   Create it with:"
+    echo "   cat > $ENV_FILE << 'EOF'"
+    echo "   SLACK_BOT_TOKEN=xoxb-..."
+    echo "   SLACK_APP_TOKEN=xapp-..."
+    echo "   SLACK_SIGNING_SECRET=..."
+    echo "   EOF"
+    echo "   chmod 600 $ENV_FILE"
+    exit 1
+fi
+
+set -a; source "$ENV_FILE"; set +a
+
+if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_APP_TOKEN" ] || [ -z "$SLACK_SIGNING_SECRET" ]; then
+    echo "❌ One or more Slack tokens missing from $ENV_FILE"
+    exit 1
+fi
+echo "✅ Slack tokens loaded"
+
+# ── 3. Clear port 9999 ────────────────────────────────────────────────────────
+echo "🔧 Clearing port 9999..."
+fuser -k 9999/tcp 2>/dev/null || lsof -ti:9999 | xargs kill -9 2>/dev/null || true
+sleep 1
+
+# ── 4. Check OpenJarvis API (WARNING only — Ollama fallback available) ────────
+echo "🔍 Checking OpenJarvis Gateway..."
+API_OK=false
+
+if systemctl --user is-active openjarvis-gateway > /dev/null 2>&1; then
+    echo "✅ openjarvis-gateway service running"
+    API_OK=true
+else
+    echo "⚠️  openjarvis-gateway not running — attempting start..."
+    if systemctl --user start openjarvis-gateway 2>/dev/null; then
+        sleep 3
+        echo "   Service started"
+        API_OK=true
+    else
+        echo "⚠️  Could not start openjarvis-gateway via systemd — trying jarvis restart..."
+        cd "$BRIDGE_DIR"
+        if jarvis restart 2>/dev/null; then
+            sleep 5
+            API_OK=true
+        fi
+    fi
+fi
+
+# Final API health check
+if ! curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+    API_OK=false
+    echo "⚠️  OpenJarvis API not responding — will use Ollama fallback"
+    echo "   (Bridge will run in Ollama-only mode until API recovers)"
+    echo "   To fix later: journalctl --user -u openjarvis-gateway -n 50"
+else
+    echo "✅ OpenJarvis API healthy"
+fi
+
+# ── 5. Check Ollama ───────────────────────────────────────────────────────────
+echo "🔍 Checking Ollama at $OLLAMA_HOST..."
+if ! curl -sf "http://$OLLAMA_HOST/api/tags" > /dev/null 2>&1; then
+    if [ "$API_OK" = false ]; then
+        echo "❌ Both OpenJarvis API and Ollama are unreachable."
+        echo "   At least one inference backend is required."
+        echo "   Start Ollama on the HOST:"
+        echo "   pkill ollama"
+        echo "   OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=30m /usr/local/bin/ollama serve &"
+        exit 1
+    else
+        echo "⚠️  Ollama not responding — running on OpenJarvis API only (no fallback)"
+    fi
+else
+    echo "✅ Ollama healthy"
+
+    # ── 6. Check models ───────────────────────────────────────────────────────
+    TAGS=$(curl -sf "http://$OLLAMA_HOST/api/tags" 2>/dev/null || echo "{}")
+
+    if echo "$TAGS" | grep -q "$PRIMARY_MODEL"; then
+        echo "✅ Primary model available: $PRIMARY_MODEL"
+    else
+        echo "⚠️  Primary model '$PRIMARY_MODEL' not found in Ollama"
+        echo "   On the HOST run: ollama create $PRIMARY_MODEL -f ~/qcai-modelfile"
+    fi
+
+    if echo "$TAGS" | grep -q "$FALLBACK_MODEL"; then
+        echo "✅ Fallback model available: $FALLBACK_MODEL"
+    else
+        echo "⚠️  Fallback model '$FALLBACK_MODEL' not found in Ollama"
+        echo "   On the HOST run:"
+   echo "   ollama pull qwen3:8b                             # download base"
+   echo "   ollama create qwen3-8b-jarvis -f ~/qwen3-8b-jarvis.modelfile  # create configured version"
+        echo "   (Required for Ollama-only mode when cloud usage resets)"
+    fi
+fi
+
+# ── 7. Create workspaces + Updates directories if missing ────────────────────
+WORKSPACES_DIR="$BRIDGE_DIR/workspaces"
+UPDATES_DIR="$BRIDGE_DIR/Updates"
+KEVIN_DIR="$UPDATES_DIR/KevinsUpdateRecommendations"
+UPDATER_DIR="$UPDATES_DIR/OpenJarvisUpdater"
+
+if [ ! -d "$WORKSPACES_DIR" ]; then
+    echo "📁 Creating workspaces directory: $WORKSPACES_DIR"
+    mkdir -p "$WORKSPACES_DIR"
+fi
+
+if [ ! -d "$UPDATES_DIR" ]; then
+    echo "📁 Creating Updates directory structure..."
+    mkdir -p "$KEVIN_DIR"
+    mkdir -p "$UPDATER_DIR"
+    echo "   ✅ $KEVIN_DIR"
+    echo "   ✅ $UPDATER_DIR"
+else
+    # Ensure subdirs exist even if Updates/ already present
+    mkdir -p "$KEVIN_DIR" "$UPDATER_DIR"
+fi
+
+# ── 8. Launch bridge ──────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🚀 Starting OpenJarvis Slack Bridge v9.1"
+echo "  Bridge:    $BRIDGE_DIR/$BRIDGE_FILE"
+echo "  API:       $([ "$API_OK" = true ] && echo 'OpenJarvis' || echo 'Ollama fallback')"
+echo "  Workspaces: $WORKSPACES_DIR"
+echo ""
+echo "  Commands in #jarvis-intake:"
+echo "    WORKSPACES         — list all projects"
+echo "    WORKSPACE <N>      — switch project"
+echo "    NEW WORKSPACE <n> \"description\" — create project"
+echo "    LOAD_TASK          — start loop on current_task.md"
+echo "    STATUS             — system status"
+echo "    SHOW_BACKEND       — which inference backend is active"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+cd "$BRIDGE_DIR"
+exec python3 "$BRIDGE_FILE"

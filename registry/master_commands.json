@@ -1,0 +1,27 @@
+{
+    "!start": {
+        "description": "Initialize the System Control Menu.",
+        "options": {
+            "1": "🚀 **Launch Full System:** Boots all 41 agents in Standard Mode (ws_1).",
+            "2": "🧪 **Launch Mode:** Choose between [Standard], [Testing], or [Deep_Research].",
+            "3": "📁 **New Project Workspace:** Create a new WS, set a mission, and auto-assign agents.",
+            "4": "🎨 **Front-End Development:** Start the 'OpenJarvis UI' project to move away from Slack."
+        }
+    },
+    "!wait": {
+        "description": "Immediate pause of the active pipeline. Agents wait for Kevin's input.",
+        "action": "pause_all_active_tasks"
+    },
+    "!resume": {
+        "description": "Resume work after a !wait pause, integrating Kevin's latest feedback.",
+        "action": "resume_with_context"
+    },
+    "!status": {
+        "description": "Show Hardware (VRAM/RAM) and Agent Health status.",
+        "action": "display_system_status"
+    },
+    "!tools": {
+        "description": "List all AI-generated qtools and system commands.",
+        "action": "trigger_refresh_links"
+    }
+}

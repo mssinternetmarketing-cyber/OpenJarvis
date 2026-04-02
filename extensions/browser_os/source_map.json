@@ -1,0 +1,22 @@
+{
+    "arxiv": {
+        "base_url": "https://arxiv.org/search/?query=",
+        "priority": 1,
+        "type": "Pre-prints / Physics / AI"
+    },
+    "zenodo": {
+        "base_url": "https://zenodo.org/search?q=",
+        "priority": 2,
+        "type": "Open Data / Datasets"
+    },
+    "researchgate": {
+        "base_url": "https://www.researchgate.net/search/publication?q=",
+        "priority": 3,
+        "type": "Peer-reviewed Articles"
+    },
+    "orcid": {
+        "base_url": "https://orcid.org/orcid-search/search?searchQuery=",
+        "priority": 4,
+        "type": "Researcher Verification / Profiles"
+    }
+}

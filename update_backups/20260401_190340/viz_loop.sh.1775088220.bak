@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# viz_loop.sh — Event-Driven QCAI Visualization Updater
+# Watches qcai_3d.py for changes using inotifywait.
+# The moment agents save a new version → validates → kills old → relaunches.
+# No polling interval — instant update on file change.
+#
+# Controls:
+#   PAUSE:  ~/viz_pause.sh
+#   RESUME: ~/viz_resume.sh
+#   STOP:   Ctrl+C or ~/stop_qcai.sh
+#
+# Usage: ~/viz_loop.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+WORKSPACE="/var/home/kmonette/OpenJarvis/workspace"
+WATCH_FILE="$WORKSPACE/qcai_3d.py"
+PYTHON="/home/kmonette/miniconda3/bin/python3"
+[ ! -f "$PYTHON" ] && PYTHON=$(which python3)
+
+PAUSE_FILE="$HOME/.qcai_viz_pause"
+LAST_LINES=0
+
+# ── Check inotifywait is available ────────────────────────────────────────────
+if ! command -v inotifywait &>/dev/null; then
+    echo "⚠️  inotifywait not found — installing inotify-tools..."
+    sudo dnf install -y inotify-tools 2>/dev/null || \
+    sudo apt-get install -y inotify-tools 2>/dev/null || \
+    rpm-ostree install inotify-tools 2>/dev/null || true
+
+    if ! command -v inotifywait &>/dev/null; then
+        echo "❌ Could not install inotify-tools automatically."
+        echo "   Run: sudo rpm-ostree install inotify-tools"
+        echo "   Then reboot and try again."
+        echo ""
+        echo "   Falling back to 60-second polling mode..."
+        FALLBACK=true
+    fi
+fi
+
+# ── Cleanup on exit ───────────────────────────────────────────────────────────
+cleanup() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  🛑 Visualization watcher stopped"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    rm -f "$PAUSE_FILE"
+    kill_viz
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# ── Kill all viz windows ──────────────────────────────────────────────────────
+kill_viz() {
+    pkill -f "qcai_3d" 2>/dev/null || true
+    fuser -k 9999/tcp 2>/dev/null || \
+        lsof -ti:9999 | xargs kill -9 2>/dev/null || true
+    sleep 1
+}
+
+# ── Syntax + fence check ──────────────────────────────────────────────────────
+check_syntax() {
+    $PYTHON -c "
+import ast, sys
+with open('$1') as f: src = f.read()
+if '\`\`\`' in src:
+    print('FENCED'); sys.exit(1)
+try:
+    ast.parse(src); print('OK')
+except SyntaxError as e:
+    print(f'ERROR: {e}'); sys.exit(1)
+" 2>/dev/null
+}
+
+# ── Launch viz in new terminal ────────────────────────────────────────────────
+launch_viz() {
+    local file="$1"
+    local label="$2"
+    local CMD="cd $WORKSPACE && $PYTHON $file; exec bash"
+
+    if   command -v ptyxis         &>/dev/null; then ptyxis --title="QCAI Viz [$label]" -- bash -c "$CMD" &
+    elif command -v gnome-terminal  &>/dev/null; then gnome-terminal --title="QCAI Viz [$label]" -- bash -c "$CMD" &
+    elif command -v konsole         &>/dev/null; then konsole --title "QCAI Viz [$label]" -e bash -c "$CMD" &
+    elif command -v xterm           &>/dev/null; then xterm -title "QCAI Viz [$label]" -e bash -c "$CMD" &
+    elif flatpak list 2>/dev/null | grep -q "org.gnome.Ptyxis"; then
+        flatpak run org.gnome.Ptyxis --title="QCAI Viz [$label]" -- bash -c "$CMD" &
+    else
+        cd "$WORKSPACE" && $PYTHON "$file" &
+    fi
+}
+
+# ── Handle a file change event ────────────────────────────────────────────────
+handle_update() {
+    local TIMESTAMP
+    TIMESTAMP=$(date +"%H:%M:%S")
+
+    echo ""
+    echo "──────────────────────────────────────────────────"
+    echo "  📝 File changed at $TIMESTAMP"
+
+    # Paused?
+    if [ -f "$PAUSE_FILE" ]; then
+        echo "  ⏸  PAUSED — ignoring update"
+        echo "     Run ~/viz_resume.sh to resume"
+        return
+    fi
+
+    # File exists?
+    if [ ! -f "$WATCH_FILE" ]; then
+        echo "  ⚠️  File disappeared — skipping"
+        return
+    fi
+
+    CURRENT_LINES=$(wc -l < "$WATCH_FILE")
+
+    # Too short?
+    if [ "$CURRENT_LINES" -lt 400 ]; then
+        echo "  ⚠️  Only $CURRENT_LINES lines — looks incomplete, skipping"
+        return
+    fi
+
+    # Validate
+    SYNTAX=$(check_syntax "$WATCH_FILE")
+
+    if [ "$SYNTAX" = "FENCED" ]; then
+        echo "  ⚠️  Markdown fences detected — Builder still outputting bad format"
+        echo "     Skipping this version, waiting for next loop"
+        return
+    fi
+
+    if [[ "$SYNTAX" == ERROR* ]]; then
+        echo "  ⚠️  Syntax error — skipping"
+        echo "  $SYNTAX"
+        return
+    fi
+
+    # Same as last version?
+    if [ "$CURRENT_LINES" -eq "$LAST_LINES" ]; then
+        echo "  ℹ️  Same line count ($CURRENT_LINES) — no meaningful change"
+        return
+    fi
+
+    # All good — update viz
+    echo "  ✅ Valid new version: $CURRENT_LINES lines (was $LAST_LINES)"
+
+    # Back up previous
+    if [ -f "$WORKSPACE/qcai_3d_running.py" ]; then
+        BACKUP="$WORKSPACE/versions/output/viz_backup_$(date +%Y%m%d_%H%M%S).py"
+        mkdir -p "$WORKSPACE/versions/output"
+        cp "$WORKSPACE/qcai_3d_running.py" "$BACKUP" 2>/dev/null || true
+        echo "  📦 Previous version backed up"
+    fi
+
+    echo "  🔪 Closing previous visualization..."
+    kill_viz
+
+    cp "$WATCH_FILE" "$WORKSPACE/qcai_3d_running.py"
+    LAST_LINES=$CURRENT_LINES
+
+    echo "  🚀 Launching updated visualization..."
+    launch_viz "qcai_3d_running.py" "$TIMESTAMP"
+    echo "  ✅ Visualization updated instantly"
+    echo "     Pause: ~/viz_pause.sh  |  Resume: ~/viz_resume.sh"
+}
+
+# ── Write helper scripts ──────────────────────────────────────────────────────
+write_helpers() {
+    cat > "$HOME/viz_pause.sh" << 'EOF'
+#!/usr/bin/env bash
+touch ~/.qcai_viz_pause
+echo "⏸  Visualization watcher PAUSED — current window will stay open"
+echo "   Run ~/viz_resume.sh to resume auto-updates"
+EOF
+    chmod +x "$HOME/viz_pause.sh"
+
+    cat > "$HOME/viz_resume.sh" << 'EOF'
+#!/usr/bin/env bash
+rm -f ~/.qcai_viz_pause
+echo "▶️  Visualization watcher RESUMED — will update on next agent save"
+echo "   Run ~/viz_pause.sh to pause again"
+EOF
+    chmod +x "$HOME/viz_resume.sh"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+write_helpers
+rm -f "$PAUSE_FILE"   # always start unpaused
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  👁  QCAI Visualization Watcher"
+echo "  Mode: Event-driven (updates instantly on agent save)"
+echo "  Watching: $WATCH_FILE"
+echo ""
+echo "  Controls:"
+echo "    PAUSE:  ~/viz_pause.sh"
+echo "    RESUME: ~/viz_resume.sh"
+echo "    STOP:   Ctrl+C or ~/stop_qcai.sh"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Wait for file to exist before watching
+if [ ! -f "$WATCH_FILE" ]; then
+    echo ""
+    echo "⏳ Waiting for $WATCH_FILE to exist..."
+    while [ ! -f "$WATCH_FILE" ]; do sleep 2; done
+    echo "  ✅ File found — starting watcher"
+fi
+
+# Initial launch with current file
+CURRENT_LINES=$(wc -l < "$WATCH_FILE")
+echo ""
+echo "▶ Initial launch with current file ($CURRENT_LINES lines)..."
+SYNTAX=$(check_syntax "$WATCH_FILE")
+if [ "$SYNTAX" = "OK" ] && [ "$CURRENT_LINES" -ge 400 ]; then
+    cp "$WATCH_FILE" "$WORKSPACE/qcai_3d_running.py"
+    LAST_LINES=$CURRENT_LINES
+    launch_viz "qcai_3d_running.py" "initial"
+    echo "  ✅ Visualization launched"
+else
+    echo "  ⚠️  Initial file not valid ($SYNTAX) — waiting for agents to produce clean version"
+fi
+
+echo ""
+echo "👁  Watching for changes..."
+
+# ── Event loop ────────────────────────────────────────────────────────────────
+if [ "${FALLBACK}" = "true" ]; then
+    # Polling fallback (60s) if inotifywait not available
+    echo "  (polling mode — 60s interval)"
+    while true; do
+        sleep 60
+        handle_update
+    done
+else
+    # inotifywait — fires instantly when file is written
+    while inotifywait -q -e close_write "$WATCH_FILE" 2>/dev/null; do
+        handle_update
+    done
+fi

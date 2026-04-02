@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Launch QCAI bridge (delegates to start_qcai.sh)
+cd /var/home/kmonette/OpenJarvis && ./start_qcai.sh

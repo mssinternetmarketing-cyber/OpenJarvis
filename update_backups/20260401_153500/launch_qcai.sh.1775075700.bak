@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# launch_qcai.sh — Master QCAI Launcher
+# Starts Ollama + Visualization + Bridge in separate terminal windows.
+# Run this from the HOST (not inside distrobox).
+#
+# Port ownership:
+#   9999  → qcai_3d.py  (visualization, HOST via miniconda)
+#   8000  → openjarvis  (gateway, distrobox systemd)
+#   11434 → Ollama      (model server, HOST)
+#
+# Usage: ~/launch_qcai.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+BRIDGE_DIR="/var/home/kmonette/OpenJarvis"
+WORKSPACE="$BRIDGE_DIR/workspace"
+PYTHON="/home/kmonette/miniconda3/bin/python3"
+[ ! -f "$PYTHON" ] && PYTHON=$(which python3)
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🚀 QCAI Master Launcher"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── Detect terminal emulator ──────────────────────────────────────────────────
+open_terminal() {
+    local title="$1"
+    local cmd="$2"
+    if   command -v ptyxis        &>/dev/null; then ptyxis --title="$title" -- bash -c "$cmd" &
+    elif command -v gnome-terminal &>/dev/null; then gnome-terminal --title="$title" -- bash -c "$cmd" &
+    elif command -v konsole        &>/dev/null; then konsole --title "$title" -e bash -c "$cmd" &
+    elif command -v xterm          &>/dev/null; then xterm -title "$title" -e bash -c "$cmd" &
+    elif command -v kitty          &>/dev/null; then kitty --title "$title" bash -c "$cmd" &
+    elif command -v alacritty      &>/dev/null; then alacritty --title "$title" -e bash -c "$cmd" &
+    elif command -v wezterm        &>/dev/null; then wezterm start --title "$title" -- bash -c "$cmd" &
+    elif flatpak list 2>/dev/null | grep -q "org.gnome.Ptyxis"; then
+        flatpak run org.gnome.Ptyxis --title="$title" -- bash -c "$cmd" &
+    elif flatpak list 2>/dev/null | grep -q "com.raggesilver.BlackBox"; then
+        flatpak run com.raggesilver.BlackBox -- bash -c "$cmd" &
+    else
+        echo "❌ No terminal emulator found. Run manually: $cmd"; return 1
+    fi
+}
+
+# ── Step 1: Clear port 9999 on host ──────────────────────────────────────────
+echo ""
+echo "▶ Clearing port 9999..."
+fuser -k 9999/tcp 2>/dev/null || lsof -ti:9999 | xargs kill -9 2>/dev/null || true
+sleep 1
+echo "  ✅ Port 9999 clear"
+
+# ── Step 2: Start Ollama on host ─────────────────────────────────────────────
+echo ""
+echo "▶ Starting Ollama..."
+pkill ollama 2>/dev/null || true
+sleep 1
+
+OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=30m /usr/local/bin/ollama serve \
+    > /tmp/ollama.log 2>&1 &
+OLLAMA_PID=$!
+sleep 3
+
+if ! curl -sf http://192.168.1.183:11434/api/tags > /dev/null 2>&1; then
+    echo "❌ Ollama failed to start. Check /tmp/ollama.log"; exit 1
+fi
+echo "  ✅ Ollama running (PID $OLLAMA_PID)"
+
+# ── Step 3: Start auto-updating visualization loop on HOST ───────────────────
+# viz_loop.sh owns port 9999, runs qcai_3d.py, auto-updates every 5 min
+echo ""
+echo "▶ Opening Visualization Loop (host, auto-updating every 5 min)..."
+
+VIZ_CMD="echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+echo '  QCAI Visualization Loop — auto-updating'
+echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+$HOME/viz_loop.sh
+exec bash"
+
+open_terminal "QCAI Visualization Loop" "$VIZ_CMD"
+echo "  ✅ Visualization loop terminal opened"
+
+sleep 3   # let viz grab port 9999 before bridge starts
+
+# ── Step 4: Start bridge inside distrobox ────────────────────────────────────
+# Bridge does NOT bind port 9999 — viz owns it
+echo ""
+echo "▶ Opening Bridge (distrobox)..."
+
+BRIDGE_CMD="echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+echo '  QCAI Bridge — v7.3'
+echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+distrobox enter openjarvis-box -- bash -c 'cd $BRIDGE_DIR && ./start_qcai.sh; exec bash'"
+
+open_terminal "QCAI Bridge" "$BRIDGE_CMD"
+echo "  ✅ Bridge terminal opened"
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ✅ All systems launching"
+echo ""
+echo "  Port map:"
+echo "    9999  → qcai_3d.py  (visualization, host)"
+echo "    8000  → openjarvis  (gateway, distrobox)"
+echo "    11434 → Ollama      (model server, host)"
+echo ""
+echo "  Visualization auto-updates every 5 min as agents improve it"
+echo "  Wait ~15 seconds, then go to Slack → #jarvis-intake"
+echo "  Type: LOAD_TASK"
+echo ""
+echo "  To stop: ~/stop_qcai.sh"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

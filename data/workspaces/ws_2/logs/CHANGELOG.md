@@ -1,0 +1,2 @@
+# QCAI Agent Loop — Changelog
+

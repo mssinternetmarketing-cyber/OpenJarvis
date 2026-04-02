@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stop all QCAI processes safely
+pkill -f slack_bridge.py 2>/dev/null && echo '✅ Bridge stopped' || echo '⚠️ Bridge not running'
+fuser -k 9999/tcp 2>/dev/null && echo '✅ Port 9999 cleared' || true
+echo 'QCAI stopped.'

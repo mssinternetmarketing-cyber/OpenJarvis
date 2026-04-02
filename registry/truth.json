@@ -1,0 +1,19 @@
+{
+  "system_version": "15.0-PRIME",
+  "infrastructure": {
+    "host_os": "Bazzite (Atomic-Stable)",
+    "primary_interface": "command-center (Fedora 43)",
+    "logic_engine": "openjarvis (Specialized Swarm)"
+  },
+  "command_center_capabilities": [
+    "Quantum Modeling (QuTiP)",
+    "Visual Analysis (JupyterLab)",
+    "Package Management (DNF5)",
+    "Sovereign Tunneling (distrobox-host-exec)"
+  ],
+  "directives": {
+    "execution": "All heavy logic happens in 'openjarvis'.",
+    "management": "All control and analysis happens in 'command-center'.",
+    "safety": "Zero-Nesting Policy (use oj-commands)."
+  }
+}

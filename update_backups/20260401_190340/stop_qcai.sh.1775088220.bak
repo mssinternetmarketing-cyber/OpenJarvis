@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# stop_qcai.sh — QCAI Safe Shutdown Script
+# Cleanly stops all QCAI processes in the correct order.
+# Run this from the HOST (not inside distrobox).
+# Usage: ./stop_qcai.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🛑 QCAI Safe Shutdown"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# ── Step 1: Stop the Slack bridge ─────────────────────────────────────────────
+echo "▶ Stopping Slack bridge..."
+if pkill -f "slack_bridge.py" 2>/dev/null; then
+    echo "  ✅ Bridge stopped"
+else
+    echo "  ℹ️  Bridge was not running"
+fi
+
+# ── Step 2: Stop the visualization loop and any open viz windows ──────────────
+echo "▶ Stopping visualization loop..."
+if pkill -f "viz_loop.sh" 2>/dev/null; then
+    echo "  ✅ Visualization loop stopped"
+else
+    echo "  ℹ️  Visualization loop was not running"
+fi
+
+echo "▶ Stopping visualization windows..."
+if pkill -f "qcai_3d" 2>/dev/null; then
+    echo "  ✅ Visualization stopped"
+else
+    echo "  ℹ️  Visualization was not running"
+fi
+
+# ── Step 3: Release port 9999 ────────────────────────────────────────────────
+echo "▶ Releasing port 9999..."
+if lsof -ti:9999 > /dev/null 2>&1; then
+    lsof -ti:9999 | xargs kill -9 2>/dev/null || true
+    echo "  ✅ Port 9999 released"
+else
+    echo "  ℹ️  Port 9999 was already free"
+fi
+
+# ── Step 4: Stop OpenJarvis gateway ──────────────────────────────────────────
+echo "▶ Stopping OpenJarvis gateway..."
+# Try systemd first (inside distrobox context)
+if distrobox enter openjarvis-box -- bash -c \
+    "systemctl --user stop openjarvis-gateway 2>/dev/null" 2>/dev/null; then
+    echo "  ✅ Gateway stopped (systemd)"
+else
+    # Fallback: kill by process name
+    if pkill -f "openjarvis" 2>/dev/null; then
+        echo "  ✅ Gateway stopped (pkill)"
+    else
+        echo "  ℹ️  Gateway was not running"
+    fi
+fi
+
+# ── Step 5: Unload model from VRAM then stop Ollama ──────────────────────────
+echo "▶ Unloading model from VRAM..."
+if curl -sf http://192.168.1.183:11434/api/tags > /dev/null 2>&1; then
+    # Set keep_alive=0 to immediately evict model from VRAM
+    curl -s -X POST http://192.168.1.183:11434/api/generate \
+        -H "Content-Type: application/json" \
+        -d '{"model":"qwen3.5:9b-qcai","keep_alive":0}' \
+        > /dev/null 2>&1 || true
+    sleep 1
+    echo "  ✅ Model evicted from VRAM"
+fi
+
+echo "▶ Stopping Ollama..."
+if pkill ollama 2>/dev/null; then
+    sleep 1
+    echo "  ✅ Ollama stopped"
+else
+    echo "  ℹ️  Ollama was not running"
+fi
+
+# ── Step 6: Verify VRAM is free ──────────────────────────────────────────────
+echo ""
+echo "▶ VRAM status:"
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader \
+    2>/dev/null | awk '{print "  Used: "$1"  Free: "$3}' || true
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ✅ QCAI shutdown complete"
+echo ""
+echo "  To restart: ~/launch_qcai.sh"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

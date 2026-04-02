@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+component_manager.py — QCAI Component File System Manager v1.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Manages the copy-on-write component system:
+
+  components_master/    READ ONLY — seeded once from master file
+  components_sandbox/   Builders work here (copies from promoted)
+  components_promoted/  Tester+Reviewer PASSED — Assembler reads here
+  components_versions/  Full history per component
+  components_logs/      Per-component test/review JSONL logs
+
+Lifecycle per component per loop:
+  1. promoted → sandbox (copy-on-write)
+  2. Builder improves sandbox
+  3. Tester validates sandbox → FAIL: back to Builder
+  4. Reviewer scores sandbox → FAIL: back to Builder  
+  5. PASS: sandbox → promoted (new version)
+  6. Version saved to components_versions/cXX/
+  7. Result logged to components_logs/cXX_log.jsonl
+"""
+
+import os, json, shutil, ast, logging
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
+
+log = logging.getLogger("component_manager")
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+COMPONENT_ORDER = [
+    "c01_header", "c02_physics", "c03_nodes", "c04_topology",
+    "c05_curriculum", "c06_system", "c07_dataserver", "c12_visualizer",
+    "c08_globe3d", "c09_metrics", "c11_controls", "c10_nodeoutput", "c13_main",
+]
+
+COMPONENT_DESCRIPTIONS = {
+    "c01_header":     "Imports, constants (N_NODES, BCP_ALPHA, CNOT, I4, BCP_U)",
+    "c02_physics":    "Physics: ss, pof, compute_pcm, bcp_step, von_neumann_entropy, compute_cv, compute_negfrac",
+    "c03_nodes":      "Nodes: NN, FAMILIES, NODE_FAMILY, FAMILY_COLORS, pcm_color, pcm_emoji",
+    "c04_topology":   "Topology: GLOBE (36 edges), icosphere_positions, NODE_POS",
+    "c05_curriculum": "Curriculum: DOMAINS, VOCAB, STEPS_PER_DOMAIN, MASTERY_THRESHOLD",
+    "c06_system":     "QCAISystem class: __init__, evolve, _generate_token, get_snapshot",
+    "c07_dataserver": "Data server: DataHandler, start_data_server, post_data_periodically",
+    "c08_globe3d":    "3D globe: _update_fig1 — nodes, edges, pulses, heal flashes",
+    "c09_metrics":    "Metrics panel: _update_fig2 — dashboard, reward chart, PCM bars",
+    "c10_nodeoutput": "Node output: show() method + Figure 2 node boxes",
+    "c11_controls":   "Controls: _on_press, _on_release, _on_motion, _on_key",
+    "c12_visualizer": "QCAIVisualizer: __init__, figure setup, FuncAnimation",
+    "c13_main":       "Entry point: assertions, system init, server threads, viz launch",
+}
+
+COMPONENT_MIN_LINES = {
+    "c01_header": 20, "c02_physics": 60, "c03_nodes": 15,
+    "c04_topology": 10, "c05_curriculum": 20, "c06_system": 80,
+    "c07_dataserver": 20, "c08_globe3d": 80, "c09_metrics": 40,
+    "c10_nodeoutput": 10, "c11_controls": 15, "c12_visualizer": 40,
+    "c13_main": 10,
+}
+
+# Which builder owns each component
+COMPONENT_BUILDER = {
+    "c01_header":     "header",
+    "c02_physics":    "physics",
+    "c03_nodes":      "curriculum",
+    "c04_topology":   "physics",
+    "c05_curriculum": "curriculum",
+    "c06_system":     "systems",
+    "c07_dataserver": "systems",
+    "c08_globe3d":    "render",
+    "c09_metrics":    "render",
+    "c10_nodeoutput": "render",
+    "c11_controls":   "integration",
+    "c12_visualizer": "integration",
+    "c13_main":       "integration",
+}
+
+
+class ComponentManager:
+
+    def __init__(self, ws_root: str):
+        self.ws_root     = ws_root
+        self.master_dir  = os.path.join(ws_root, "components_master")
+        self.sandbox_dir = os.path.join(ws_root, "components_sandbox")
+        self.promoted_dir= os.path.join(ws_root, "components_promoted")
+        self.versions_dir= os.path.join(ws_root, "components_versions")
+        self.logs_dir    = os.path.join(ws_root, "components_logs")
+
+        for d in [self.master_dir, self.sandbox_dir, self.promoted_dir,
+                  self.versions_dir, self.logs_dir]:
+            os.makedirs(d, exist_ok=True)
+
+        for name in COMPONENT_ORDER:
+            os.makedirs(os.path.join(self.versions_dir, name), exist_ok=True)
+
+    # ── I/O ──────────────────────────────────────────────────────────────────
+
+    def _path(self, name: str, tier: str) -> str:
+        dirs = {
+            "master":   self.master_dir,
+            "sandbox":  self.sandbox_dir,
+            "promoted": self.promoted_dir,
+        }
+        return os.path.join(dirs[tier], f"{name}.py")
+
+    def read(self, name: str, tier: str = "promoted") -> Optional[str]:
+        path = self._path(name, tier)
+        try:
+            with open(path) as f: return f.read()
+        except FileNotFoundError: return None
+
+    def write(self, name: str, code: str, tier: str = "sandbox") -> bool:
+        if tier == "master":
+            log.error(f"BLOCKED: Attempt to write to master tier for {name}")
+            return False
+        path = self._path(name, tier)
+        try:
+            with open(path, "w") as f: f.write(code)
+            return True
+        except Exception as e:
+            log.error(f"Write {tier}/{name}: {e}"); return False
+
+    # ── Copy-on-Write ─────────────────────────────────────────────────────────
+
+    def copy_to_sandbox(self, name: str) -> bool:
+        """
+        Copy promoted version to sandbox for Builder to work on.
+        If no promoted version exists, copy from master.
+        """
+        # Try promoted first
+        promoted = self.read(name, "promoted")
+        if promoted:
+            ok = self.write(name, promoted, "sandbox")
+            if ok: log.info(f"CoW: {name} promoted→sandbox")
+            return ok
+
+        # Fall back to master
+        master = self.read(name, "master")
+        if master:
+            ok = self.write(name, master, "sandbox")
+            if ok: log.info(f"CoW: {name} master→sandbox (no promoted)")
+            return ok
+
+        log.warning(f"CoW: {name} — no source found")
+        return False
+
+    def promote_sandbox(self, name: str, loop: int, attempt: int) -> bool:
+        """
+        Promote sandbox → promoted after passing Tester + Reviewer.
+        Saves version history.
+        """
+        sandbox = self.read(name, "sandbox")
+        if not sandbox:
+            log.error(f"Promote {name}: no sandbox content")
+            return False
+
+        # Save versioned copy
+        self.save_version(name, sandbox, loop, attempt)
+
+        # Write to promoted
+        ok = self.write(name, sandbox, "promoted")
+        if ok:
+            log.info(f"Promoted: {name} loop={loop} attempt={attempt} "
+                     f"({sandbox.count(chr(10))} lines)")
+        return ok
+
+    # ── Version Management ────────────────────────────────────────────────────
+
+    def save_version(self, name: str, code: str,
+                     loop: int, attempt: int) -> str:
+        """Save a versioned copy. Returns path."""
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname= f"loop_{loop:03d}_attempt_{attempt:02d}_{ts}.py"
+        path = os.path.join(self.versions_dir, name, fname)
+        try:
+            with open(path, "w") as f: f.write(code)
+            log.info(f"Version saved: {name}/{fname}")
+            return path
+        except Exception as e:
+            log.error(f"Save version {name}: {e}"); return ""
+
+    def list_versions(self, name: str, limit: int = 10) -> List[str]:
+        """List most recent versions for a component."""
+        d = os.path.join(self.versions_dir, name)
+        if not os.path.exists(d): return []
+        files = sorted(os.listdir(d))
+        return files[-limit:]
+
+    def get_version(self, name: str, version_file: str) -> Optional[str]:
+        """Read a specific version file."""
+        path = os.path.join(self.versions_dir, name, version_file)
+        try:
+            with open(path) as f: return f.read()
+        except: return None
+
+    def get_best_version(self, name: str) -> Optional[str]:
+        """
+        Get the best previous version based on test/review logs.
+        Falls back to most recent.
+        """
+        # Check logs for highest scoring version
+        log_path = os.path.join(self.logs_dir, f"{name}_log.jsonl")
+        if os.path.exists(log_path):
+            best_score = -1
+            best_version = None
+            try:
+                with open(log_path) as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        if (entry.get("outcome") == "PROMOTED" and
+                                entry.get("review_score", 0) > best_score):
+                            best_score = entry["review_score"]
+                            best_version = entry.get("version_file")
+                if best_version:
+                    code = self.get_version(name, best_version)
+                    if code: return code
+            except: pass
+
+        # Fall back to most recent version
+        versions = self.list_versions(name)
+        if versions:
+            return self.get_version(name, versions[-1])
+        return None
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+
+    def log_attempt(self, name: str, loop: int, attempt: int,
+                    test_result: dict, review_result: dict,
+                    outcome: str, version_file: str = ""):
+        """Append a test/review attempt to the component's log."""
+        entry = {
+            "timestamp":     datetime.now().isoformat(),
+            "loop":          loop,
+            "attempt":       attempt,
+            "outcome":       outcome,           # PROMOTED | RETRY | MAX_RETRIES
+            "version_file":  version_file,
+            "test_passed":   test_result.get("passed", False),
+            "test_failures": test_result.get("failures", []),
+            "review_score":  review_result.get("score", 0),
+            "review_notes":  review_result.get("notes", ""),
+            "lines":         test_result.get("lines", 0),
+        }
+        log_path = os.path.join(self.logs_dir, f"{name}_log.jsonl")
+        try:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            log.error(f"Log attempt {name}: {e}")
+
+    def get_component_history(self, name: str, limit: int = 10) -> List[dict]:
+        """Get recent history for a component from logs."""
+        log_path = os.path.join(self.logs_dir, f"{name}_log.jsonl")
+        if not os.path.exists(log_path): return []
+        entries = []
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    entries.append(json.loads(line))
+        except: pass
+        return entries[-limit:]
+
+    def get_failure_context(self, name: str) -> str:
+        """
+        Get a summary of recent failures for a component.
+        Used to give Builder context on what's been tried.
+        """
+        history = self.get_component_history(name, 5)
+        if not history: return ""
+
+        failures = [e for e in history if e.get("outcome") != "PROMOTED"]
+        if not failures: return "No recent failures — all attempts promoted."
+
+        lines = [f"Recent {name} failures (last {len(failures)} attempts):"]
+        for e in failures[-3:]:
+            lines.append(
+                f"  Loop {e['loop']} Attempt {e['attempt']}: "
+                f"Test={'PASS' if e['test_passed'] else 'FAIL'} "
+                f"Score={e['review_score']}/10"
+            )
+            if e.get("test_failures"):
+                for f_ in e["test_failures"][:2]:
+                    lines.append(f"    ❌ {f_}")
+            if e.get("review_notes"):
+                lines.append(f"    📝 {e['review_notes'][:100]}")
+        return "\n".join(lines)
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
+    def clear_versions(self, name: Optional[str] = None,
+                       keep: int = 5) -> Dict[str, int]:
+        """
+        Clear version history. NEVER deletes master, promoted, or logs.
+        Args:
+            name: specific component name, or None for all
+            keep: number of most recent versions to keep per component
+        Returns: {component: versions_deleted}
+        """
+        targets = [name] if name else COMPONENT_ORDER
+        deleted = {}
+
+        for comp in targets:
+            ver_dir = os.path.join(self.versions_dir, comp)
+            if not os.path.exists(ver_dir):
+                deleted[comp] = 0
+                continue
+
+            files = sorted(os.listdir(ver_dir))
+            to_delete = files[:-keep] if len(files) > keep else []
+
+            for f in to_delete:
+                try:
+                    os.remove(os.path.join(ver_dir, f))
+                except Exception as e:
+                    log.error(f"Delete {comp}/{f}: {e}")
+
+            deleted[comp] = len(to_delete)
+            if to_delete:
+                log.info(f"Cleared {len(to_delete)} old versions for {comp} (kept {keep})")
+
+        return deleted
+
+    def clear_sandbox(self, name: Optional[str] = None):
+        """Clear sandbox files (safe — promoted copies are untouched)."""
+        targets = [name] if name else COMPONENT_ORDER
+        for comp in targets:
+            path = self._path(comp, "sandbox")
+            if os.path.exists(path):
+                os.remove(path)
+                log.info(f"Cleared sandbox: {comp}")
+
+    # ── Seeding ───────────────────────────────────────────────────────────────
+
+    def seed_from_files(self, component_files: Dict[str, str]) -> Dict[str, bool]:
+        """
+        Seed master and promoted from pre-split component files.
+        component_files: {name: code_string}
+        """
+        results = {}
+        for name, code in component_files.items():
+            # Write to master (one time only — don't overwrite if exists)
+            master_path = self._path(name, "master")
+            if not os.path.exists(master_path):
+                with open(master_path, "w") as f: f.write(code)
+                log.info(f"Seeded master: {name}")
+
+            # Write to promoted (if none exists)
+            promoted_path = self._path(name, "promoted")
+            if not os.path.exists(promoted_path):
+                with open(promoted_path, "w") as f: f.write(code)
+                log.info(f"Seeded promoted: {name}")
+
+            # Always write fresh sandbox from master
+            self.copy_to_sandbox(name)
+            results[name] = True
+
+        return results
+
+    def seed_all_to_sandbox(self):
+        """Copy all promoted (or master) versions to sandbox."""
+        for name in COMPONENT_ORDER:
+            self.copy_to_sandbox(name)
+        log.info("All components copied to sandbox")
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def status_report(self) -> str:
+        """Generate full status report of all component tiers."""
+        lines = ["```", f"{'Component':<20} {'Master':>6} {'Promoted':>8} {'Sandbox':>7} {'Versions':>8}"]
+        lines.append("-" * 55)
+
+        for name in COMPONENT_ORDER:
+            master_l   = self._count_lines(name, "master")
+            promoted_l = self._count_lines(name, "promoted")
+            sandbox_l  = self._count_lines(name, "sandbox")
+            n_versions = len(self.list_versions(name))
+
+            history = self.get_component_history(name, 3)
+            last_outcome = history[-1].get("outcome", "—") if history else "—"
+            icon = "✅" if last_outcome == "PROMOTED" else "🔄" if last_outcome == "RETRY" else "⬜"
+
+            lines.append(
+                f"{icon} {name:<18} "
+                f"{master_l:>6}L "
+                f"{promoted_l:>7}L "
+                f"{sandbox_l:>6}L "
+                f"{n_versions:>7}v"
+            )
+        lines.append("```")
+
+        return "\n".join(lines)
+
+    def _count_lines(self, name: str, tier: str) -> int:
+        code = self.read(name, tier)
+        return code.count("\n") if code else 0
+
+    # ── Rollback ──────────────────────────────────────────────────────────────
+
+    def rollback_promoted(self, name: str, version_file: str) -> bool:
+        """Roll back promoted to a specific version."""
+        code = self.get_version(name, version_file)
+        if not code:
+            log.error(f"Rollback {name}: version {version_file} not found")
+            return False
+        ok = self.write(name, code, "promoted")
+        if ok:
+            log.info(f"Rolled back {name} to {version_file}")
+        return ok
+
+    def rollback_to_master(self, name: str) -> bool:
+        """Roll back promoted to master version."""
+        master = self.read(name, "master")
+        if not master:
+            log.error(f"Rollback to master {name}: no master found")
+            return False
+        ok = self.write(name, master, "promoted")
+        if ok:
+            log.info(f"Rolled back {name} to master")
+        return ok

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# launch_qcai.sh v9.1 — Primary QCAI launcher
+# Full preflight: tokens, port clear, API check, Ollama check, model check.
+# Usage: ~/launch_qcai.sh
+#
+# Your main sequence:
+#   ~/reset_workspace.sh && ~/stop_qcai.sh && ~/launch_qcai.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+exec /var/home/kmonette/OpenJarvis/start_qcai.sh

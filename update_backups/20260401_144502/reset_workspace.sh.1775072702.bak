@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# reset_workspace.sh — QCAI Workspace Reset (v8.0 — Copy-on-Write)
+# Clears all agent output and versioned history.
+# Restores clean base to both protected/ master and qcai_3d.py.
+# Keeps: current_task.md, GROUND_TRUTH.md
+# Run from HOST terminal.
+# Usage: ~/reset_workspace.sh
+# ─────────────────────────────────────────────────────────────────────────────
+
+WORKSPACE="/var/home/kmonette/OpenJarvis/workspace"
+PROTECTED="$WORKSPACE/protected"
+SANDBOX="$WORKSPACE/sandbox"
+MASTER="$PROTECTED/qcai_3d_master.py"
+CLEAN_BASE="$WORKSPACE/qcai_3d_CLEAN_BASE.py"
+PROMOTED="$WORKSPACE/qcai_3d.py"
+DOWNLOADS="$HOME/Downloads/qcai_3d.py"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🔄 QCAI Workspace Reset (v8.0)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# ── Ensure folder structure exists ────────────────────────────────────────────
+mkdir -p "$PROTECTED" "$SANDBOX" \
+    "$WORKSPACE/versions/intake" "$WORKSPACE/versions/prime" \
+    "$WORKSPACE/versions/builder" "$WORKSPACE/versions/physics" \
+    "$WORKSPACE/versions/output" "$WORKSPACE/checkpoints" "$WORKSPACE/logs"
+echo "▶ Folder structure verified"
+
+# ── Find source for clean base ────────────────────────────────────────────────
+echo ""
+echo "▶ Restoring clean base files..."
+
+if [ -f "$CLEAN_BASE" ]; then
+    SOURCE="$CLEAN_BASE"
+    SOURCE_LABEL="qcai_3d_CLEAN_BASE.py"
+elif [ -f "$DOWNLOADS" ]; then
+    SOURCE="$DOWNLOADS"
+    SOURCE_LABEL="~/Downloads/qcai_3d.py"
+else
+    echo "  ❌ No clean base found!"
+    echo "     Download qcai_3d.py and place in ~/Downloads/"
+    echo "     Or ensure qcai_3d_CLEAN_BASE.py exists in workspace"
+    exit 1
+fi
+
+BASE_LINES=$(wc -l < "$SOURCE")
+
+# Copy to all the right places
+cp "$SOURCE" "$MASTER"           # protected master (agents read this)
+cp "$SOURCE" "$PROMOTED"         # promoted output (viz_loop watches this)
+cp "$SOURCE" "$CLEAN_BASE"       # keep clean base reference
+
+echo "  ✅ protected/qcai_3d_master.py  ← $BASE_LINES lines  [from $SOURCE_LABEL]"
+echo "  ✅ qcai_3d.py                   ← $BASE_LINES lines  [promoted]"
+echo "  ✅ qcai_3d_CLEAN_BASE.py        ← $BASE_LINES lines  [reference]"
+
+# ── Clear sandbox ─────────────────────────────────────────────────────────────
+echo ""
+echo "▶ Clearing sandbox..."
+rm -f "$SANDBOX/qcai_3d_working.py"
+rm -f "$SANDBOX/qcai_3d_candidate.py"
+echo "  ✅ sandbox/ cleared"
+
+# ── Remove stale agent output files ──────────────────────────────────────────
+echo ""
+echo "▶ Removing stale agent outputs..."
+rm -f "$WORKSPACE/builder_code.py"
+rm -f "$WORKSPACE/intake_brief.md"
+rm -f "$WORKSPACE/physics_report.md"
+rm -f "$WORKSPACE/prime_plan.md"
+rm -f "$WORKSPACE/qcai_3d_running.py"
+echo "  ✅ Stale files removed"
+
+# ── Clear versioned history ───────────────────────────────────────────────────
+echo ""
+echo "▶ Clearing versioned history..."
+rm -rf "$WORKSPACE/versions/intake"/*
+rm -rf "$WORKSPACE/versions/prime"/*
+rm -rf "$WORKSPACE/versions/builder"/*
+rm -rf "$WORKSPACE/versions/physics"/*
+rm -rf "$WORKSPACE/versions/output"/*
+echo "  ✅ Version history cleared"
+
+# ── Clear checkpoints ────────────────────────────────────────────────────────
+echo ""
+echo "▶ Clearing checkpoints..."
+rm -rf "$WORKSPACE/checkpoints"/*
+echo "  ✅ Checkpoints cleared"
+
+# ── Reset logs ────────────────────────────────────────────────────────────────
+echo ""
+echo "▶ Resetting logs..."
+echo "# QCAI Agent Loop — Changelog" > "$WORKSPACE/logs/CHANGELOG.md"
+echo ""                               >> "$WORKSPACE/logs/CHANGELOG.md"
+echo "# QCAI Physics Summary Log"    > "$WORKSPACE/logs/SUMMARY.md"
+echo ""                               >> "$WORKSPACE/logs/SUMMARY.md"
+rm -f "$WORKSPACE/logs/metrics_log.jsonl"
+echo "  ✅ Logs reset"
+
+# ── Final verification ────────────────────────────────────────────────────────
+echo ""
+echo "▶ Final state:"
+echo ""
+echo "  protected/"
+ls -lh "$PROTECTED"/*.py 2>/dev/null | awk '{print "    "$5"\t"$9}' | sed "s|$PROTECTED/||"
+echo "  sandbox/"
+ls "$SANDBOX"/*.py 2>/dev/null | sed "s|$SANDBOX/||" | awk '{print "    (empty)"}' || echo "    (empty)"
+echo "  workspace/"
+ls -lh "$WORKSPACE"/*.py "$WORKSPACE"/*.md 2>/dev/null | \
+    awk '{print "    "$5"\t"$9}' | sed "s|$WORKSPACE/||"
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ✅ Workspace reset complete (v8.0)"
+echo ""
+echo "  Protected master: $BASE_LINES lines (read-only to agents)"
+echo "  Sandbox: empty (Builder will populate on Loop 1)"
+echo "  Promoted: $BASE_LINES lines (viz_loop watching)"
+echo ""
+echo "  Next: ~/launch_qcai.sh → LOAD_TASK in Slack"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

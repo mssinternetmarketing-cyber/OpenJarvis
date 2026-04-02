@@ -1,0 +1,7 @@
+{
+    "browser_os": {
+        "status": "active",
+        "entry_point": "extensions/browser_os/browser_launcher.py",
+        "dependencies": ["playwright", "chromium"]
+    }
+}

@@ -1,0 +1,7 @@
+target/
+rust/target/
+.venv/
+**/*.so
+**/*.rlib
+**/*.pyc
+.ipynb_checkpoints/
